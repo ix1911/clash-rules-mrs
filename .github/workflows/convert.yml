@@ -83,48 +83,13 @@ jobs:
 
           SOURCES = [
               {
-                  "id": "cn-blocked-domain",
-                  "name": "Loyalsoldier/cn-blocked-domain",
-                  "repo_url": "https://github.com/Loyalsoldier/cn-blocked-domain",
-                  "description": (
-                      "通过 GreatFire Analyzer 的 JSON API"
-                      "（https://en.greatfire.org/api/tags?status=blocked）"
-                      "获取在中国大陆被屏蔽的域名和 IP 地址，并进行校验、去重与聚合。"
-                  ),
-                  "rules": [
-                      {
-                          "out": "cn-blocked-domains",
-                          "src_name": "domains.txt",
-                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/domains.txt",
-                          "behavior": "domain",
-                          "mode": "plain_domain",
-                          "desc": "中国大陆被屏蔽域名列表",
-                      },
-                      {
-                          "out": "cn-blocked-ip",
-                          "src_name": "ip.txt",
-                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/ip.txt",
-                          "behavior": "ipcidr",
-                          "mode": "plain_ip",
-                          "desc": "中国大陆被屏蔽 IP 地址列表",
-                          "allow_empty": True,
-                      },
-                      {
-                          "out": "cn-blocked-deduplicated-domains",
-                          "src_name": "deduplicated-domains.txt",
-                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/deduplicated-domains.txt",
-                          "behavior": "domain",
-                          "mode": "plain_domain",
-                          "desc": "因父域名已存在而被移除的子域名",
-                          "allow_empty": True,
-                      },
-                  ],
-                  "extras": [],
-              },
-              {
                   "id": "clash-rules",
+                  "tag": "clash-rules",
+                  "title": "Loyalsoldier/clash-rules (MRS)",
+                  "is_latest": True,
                   "name": "Loyalsoldier/clash-rules",
                   "repo_url": "https://github.com/Loyalsoldier/clash-rules",
+                  "sample_mrs": "direct.mrs",
                   "description": (
                       "适用于 Clash Premium / Mihomo 内核及各 GUI 客户端（ClashX Pro、clash-party、"
                       "clash-verge-rev、Clash for Windows、clashmi、Clash Meta for Android、OpenClash 等）"
@@ -238,8 +203,12 @@ jobs:
               },
               {
                   "id": "v2ray-rules-dat",
+                  "tag": "v2ray-rules-dat",
+                  "title": "Loyalsoldier/v2ray-rules-dat (MRS)",
+                  "is_latest": False,
                   "name": "Loyalsoldier/v2ray-rules-dat",
                   "repo_url": "https://github.com/Loyalsoldier/v2ray-rules-dat",
+                  "sample_mrs": "direct-list.mrs",
                   "description": (
                       "V2Ray 路由规则文件加强版，适用于 V2Ray、Xray-core、mihomo、hysteria、"
                       "Trojan-Go、leaf 及各 GUI 版代理软件，上游每天北京时间 06:00 自动构建。"
@@ -296,12 +265,12 @@ jobs:
                           "desc": "Google 在中国大陆可直连的域名列表",
                       },
                       {
-                          "out": "v2ray-gfw",
+                          "out": "gfw",
                           "src_name": "gfw.txt",
                           "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt",
                           "behavior": "domain",
                           "mode": "v2ray_domain",
-                          "desc": "GFWList 域名列表（防重名输出为 v2ray-gfw.mrs）",
+                          "desc": "GFWList 域名列表",
                       },
                       {
                           "out": "win-spy",
@@ -341,6 +310,49 @@ jobs:
                       },
                   ],
               },
+              {
+                  "id": "cn-blocked-domain",
+                  "tag": "cn-blocked-domain",
+                  "title": "Loyalsoldier/cn-blocked-domain (MRS)",
+                  "is_latest": False,
+                  "name": "Loyalsoldier/cn-blocked-domain",
+                  "repo_url": "https://github.com/Loyalsoldier/cn-blocked-domain",
+                  "sample_mrs": "domains.mrs",
+                  "description": (
+                      "通过 GreatFire Analyzer 的 JSON API"
+                      "（https://en.greatfire.org/api/tags?status=blocked）"
+                      "获取在中国大陆被屏蔽的域名和 IP 地址，并进行校验、去重与聚合。"
+                  ),
+                  "rules": [
+                      {
+                          "out": "domains",
+                          "src_name": "domains.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/domains.txt",
+                          "behavior": "domain",
+                          "mode": "plain_domain",
+                          "desc": "中国大陆被屏蔽域名列表",
+                      },
+                      {
+                          "out": "ip",
+                          "src_name": "ip.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/ip.txt",
+                          "behavior": "ipcidr",
+                          "mode": "plain_ip",
+                          "desc": "中国大陆被屏蔽 IP 地址列表",
+                          "allow_empty": True,
+                      },
+                      {
+                          "out": "deduplicated-domains",
+                          "src_name": "deduplicated-domains.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/deduplicated-domains.txt",
+                          "behavior": "domain",
+                          "mode": "plain_domain",
+                          "desc": "因父域名已存在而被移除的子域名",
+                          "allow_empty": True,
+                      },
+                  ],
+                  "extras": [],
+              },
           ]
 
           LABEL_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
@@ -368,6 +380,7 @@ jobs:
               return ascii_domain
 
           def download(url: str, dest: pathlib.Path) -> None:
+              dest.parent.mkdir(parents=True, exist_ok=True)
               subprocess.run(
                   [
                       "curl", "-fsSL",
@@ -416,6 +429,7 @@ jobs:
                       continue
                   seen.add(f"{prefix}{norm}")
               items = sorted(seen)
+              dst.parent.mkdir(parents=True, exist_ok=True)
               dst.write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
               return len(items), skipped, samples
 
@@ -447,6 +461,7 @@ jobs:
                       continue
                   seen.add(f"{prefix}{norm}")
               items = sorted(seen)
+              dst.parent.mkdir(parents=True, exist_ok=True)
               dst.write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
               return len(items), skipped, samples
 
@@ -454,13 +469,11 @@ jobs:
               line = raw_line.split("#", 1)[0].strip()
               if not line:
                   return []
-              # Strip optional YAML list prefix or quotes
               if line.startswith("- "):
                   line = line[2:].strip()
               line = line.strip("'\"")
               if not line or line.lower() == "payload:":
                   return []
-              # Strip optional Clash/V2Ray prefixes & trailing flags (e.g. IP-CIDR,1.2.3.4/32,no-resolve)
               upper = line.upper()
               if upper.startswith(("IP-CIDR,", "IP-CIDR6,")):
                   line = line.split(",", 2)[1].strip()
@@ -468,18 +481,14 @@ jobs:
                   line = line[3:].strip()
               elif "," in line:
                   line = line.split(",", 1)[0].strip()
-              # Strip whitespace-separated inline annotations
               line = line.split()[0].strip("'\"")
-              # Handle bracketed IPv6 with optional port: [2001:db8::1]:443 or [2001:db8::1]
               m = BRACKET_IP_RE.match(line)
               if m:
                   line = m.group(1)
-              # Handle IPv4 with port: 1.2.3.4:443 (IPv6 always contains >= 2 colons)
               elif line.count(":") == 1:
                   host, port = line.split(":", 1)
                   if port.isdigit():
                       line = host
-              # Handle IP range: 1.2.3.4-1.2.3.10
               if "-" in line and "/" not in line:
                   left, right = line.split("-", 1)
                   try:
@@ -514,6 +523,7 @@ jobs:
               collapsed = [str(n) for n in ipaddress.collapse_addresses(v4_nets)] + [
                   str(n) for n in ipaddress.collapse_addresses(v6_nets)
               ]
+              dst.parent.mkdir(parents=True, exist_ok=True)
               dst.write_text("\n".join(collapsed) + ("\n" if collapsed else ""), encoding="utf-8")
               return len(collapsed), skipped, samples
 
@@ -525,9 +535,9 @@ jobs:
                   size /= 1024
               return f"{num_bytes} B"
 
-          # 1. Parallel download for speed while preserving deterministic build order
+          # 1. Parallel download into per-source subdirectories (no filename collisions)
           download_tasks = [
-              (rule["url"], RAW_DIR / f"{rule['out']}.txt", source["id"], rule["src_name"])
+              (rule["url"], RAW_DIR / source["id"] / f"{rule['out']}.txt", source["id"], rule["src_name"])
               for source in SOURCES
               for rule in source["rules"]
           ]
@@ -545,22 +555,31 @@ jobs:
                   except Exception as exc:
                       sys.exit(f"Failed downloading [{sid}] {sname} ({url}): {exc}")
 
-          # 2. Deterministic preprocess, convert & verify
+          # 2. Deterministic preprocess, convert & verify per source
           manifest = []
+          global_checksum_lines = []
           for source in SOURCES:
+              sid = source["id"]
+              src_out_dir = OUT_DIR / sid
+              src_out_dir.mkdir(parents=True, exist_ok=True)
               src_entry = {
-                  "id": source["id"],
+                  "id": sid,
+                  "tag": source["tag"],
+                  "title": source["title"],
+                  "is_latest": source["is_latest"],
                   "name": source["name"],
                   "repo_url": source["repo_url"],
+                  "sample_mrs": source["sample_mrs"],
                   "description": source["description"],
                   "rules": [],
                   "extras": source["extras"],
               }
+
               for rule in source["rules"]:
                   out_stem = rule["out"]
                   mrs_name = f"{out_stem}.mrs"
-                  raw_path = RAW_DIR / f"{out_stem}.txt"
-                  out_path = OUT_DIR / mrs_name
+                  raw_path = RAW_DIR / sid / f"{out_stem}.txt"
+                  out_path = src_out_dir / mrs_name
                   allow_empty = rule.get("allow_empty", False)
 
                   mode = rule["mode"]
@@ -571,7 +590,7 @@ jobs:
                       src_for_mihomo = raw_path
                       mihomo_fmt = "yaml"
                   else:
-                      clean_path = CLEAN_DIR / f"{out_stem}.txt"
+                      clean_path = CLEAN_DIR / sid / f"{out_stem}.txt"
                       if mode == "plain_domain":
                           count, skipped, samples = preprocess_plain_domain(raw_path, clean_path)
                       elif mode == "v2ray_domain":
@@ -585,7 +604,7 @@ jobs:
                           raw_bytes = raw_path.stat().st_size
                           diag = f"raw_bytes={raw_bytes}, skipped={skipped}, samples={samples}"
                           if allow_empty:
-                              print(f"  WARN: [{source['id']}] {rule['src_name']} has 0 valid entries ({diag}), skipping MRS.")
+                              print(f"  WARN: [{sid}] {rule['src_name']} has 0 valid entries ({diag}), skipping MRS.")
                               src_entry["rules"].append({
                                   **rule,
                                   "mrs": mrs_name,
@@ -607,7 +626,7 @@ jobs:
                       sys.exit(f"Empty MRS output: {out_path}")
 
                   size_str = human_size(out_path.stat().st_size)
-                  print(f"  OK: {mrs_name} ({count} rules, {size_str}, skipped={skipped})")
+                  print(f"  OK: {sid}/{mrs_name} ({count} rules, {size_str}, skipped={skipped})")
                   src_entry["rules"].append({
                       **rule,
                       "mrs": mrs_name,
@@ -616,20 +635,28 @@ jobs:
                       "count": count,
                       "skipped": skipped,
                   })
+
+              # Per-source checksums.sha256 (used by each independent Release)
+              src_checksums = []
+              for mrs_file in sorted(src_out_dir.glob("*.mrs"), key=lambda p: p.name):
+                  digest = hashlib.sha256(mrs_file.read_bytes()).hexdigest()
+                  src_checksums.append(f"{digest}  {mrs_file.name}")
+                  global_checksum_lines.append(f"{digest}  {sid}/{mrs_file.name}")
+              if not src_checksums:
+                  sys.exit(f"Source {sid} produced 0 MRS files")
+              (src_out_dir / "checksums.sha256").write_text("\n".join(src_checksums) + "\n", encoding="utf-8")
               manifest.append(src_entry)
 
-          checksum_lines = []
-          for mrs_file in sorted(OUT_DIR.glob("*.mrs"), key=lambda p: p.name):
-              digest = hashlib.sha256(mrs_file.read_bytes()).hexdigest()
-              checksum_lines.append(f"{digest}  {mrs_file.name}")
-          (OUT_DIR / "checksums.sha256").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+          # Global checksums.sha256 (used by the orphan release branch)
+          global_checksum_lines.sort(key=lambda line: line.split("  ", 1)[1])
+          (OUT_DIR / "checksums.sha256").write_text("\n".join(global_checksum_lines) + "\n", encoding="utf-8")
           pathlib.Path("build_manifest.json").write_text(
               json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
           )
-          print(f"Total MRS files built: {len(checksum_lines)}")
+          print(f"Total MRS files built across {len(manifest)} sources: {len(global_checksum_lines)}")
           PY
 
-      - name: Detect changes (branch & release independently)
+      - name: Detect changes (branch & each release independently)
         id: diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -637,14 +664,20 @@ jobs:
           FORCE_PUBLISH: ${{ inputs.force_publish || github.event.inputs.force_publish || 'false' }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+
+          # Publish order: non-latest releases first, primary (clash-rules) last
+          TAGS=(cn-blocked-domain v2ray-rules-dat clash-rules)
+
           if [ "$FORCE_PUBLISH" = "true" ]; then
-            echo "Force publish enabled for both branch and release."
+            echo "Force publish enabled for orphan branch and all releases."
             echo "branch_changed=true" >> "$GITHUB_OUTPUT"
-            echo "release_changed=true" >> "$GITHUB_OUTPUT"
+            echo "changed_releases=${TAGS[*]}" >> "$GITHUB_OUTPUT"
+            echo "any_release_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # 1. Check orphan release branch via lightweight Contents API (no full binary clone)
+          # 1. Check orphan release branch via lightweight Contents API
           branch_changed=true
           if gh api -H "Accept: application/vnd.github.raw+json" \
             "repos/${GH_REPO}/contents/checksums.sha256?ref=release" > prev_branch.sha256 2>/dev/null; then
@@ -653,25 +686,39 @@ jobs:
             fi
           fi
 
-          # 2. Check GitHub Releases (latest) independently to auto-heal split-brain states
-          release_changed=true
-          if gh release download latest --repo "$GH_REPO" --pattern "checksums.sha256" --output prev_release.sha256 2>/dev/null; then
-            if cmp -s prev_release.sha256 out/checksums.sha256; then
-              (cd out && ls -1 *.mrs checksums.sha256 | LC_ALL=C sort) > expected_assets.txt
-              gh release view latest --repo "$GH_REPO" --json assets -q '.assets[].name' | LC_ALL=C sort > remote_assets.txt
-              if cmp -s expected_assets.txt remote_assets.txt; then
-                release_changed=false
+          # 2. Check each of the 3 Releases independently
+          changed_list=()
+          for tag in "${TAGS[@]}"; do
+            rel_changed=true
+            if gh release download "$tag" --repo "$GH_REPO" \
+              --pattern "checksums.sha256" --output "prev_${tag}.sha256" 2>/dev/null; then
+              if cmp -s "prev_${tag}.sha256" "out/${tag}/checksums.sha256"; then
+                (cd "out/${tag}" && ls -1 *.mrs checksums.sha256 | LC_ALL=C sort) > "expected_${tag}.txt"
+                gh release view "$tag" --repo "$GH_REPO" --json assets -q '.assets[].name' | LC_ALL=C sort > "remote_${tag}.txt"
+                if cmp -s "expected_${tag}.txt" "remote_${tag}.txt"; then
+                  rel_changed=false
+                fi
               fi
             fi
+            echo "release[${tag}]_changed=${rel_changed}"
+            if [ "$rel_changed" = "true" ]; then
+              changed_list+=("$tag")
+            fi
+          done
+
+          any_release_changed=false
+          if [ "${#changed_list[@]}" -gt 0 ]; then
+            any_release_changed=true
           fi
 
           echo "branch_changed=${branch_changed}"
-          echo "release_changed=${release_changed}"
+          echo "changed_releases=${changed_list[*]}"
           echo "branch_changed=${branch_changed}" >> "$GITHUB_OUTPUT"
-          echo "release_changed=${release_changed}" >> "$GITHUB_OUTPUT"
+          echo "changed_releases=${changed_list[*]}" >> "$GITHUB_OUTPUT"
+          echo "any_release_changed=${any_release_changed}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate release notes
-        if: steps.diff.outputs.branch_changed == 'true' || steps.diff.outputs.release_changed == 'true'
+      - name: Generate release notes & branch README
+        if: steps.diff.outputs.branch_changed == 'true' || steps.diff.outputs.any_release_changed == 'true'
         env:
           GH_REPO: ${{ github.repository }}
         run: |
@@ -686,33 +733,19 @@ jobs:
           mihomo_version = os.environ["MIHOMO_VERSION"]
           now_utc = datetime.datetime.now(datetime.timezone.utc)
           now_cst = now_utc + datetime.timedelta(hours=8)
+          time_str = f"{now_cst:%Y-%m-%d %H:%M} (UTC+8) / {now_utc:%Y-%m-%d %H:%M} UTC"
+
           manifest = json.loads(pathlib.Path("build_manifest.json").read_text(encoding="utf-8"))
-          total_mrs = sum(1 for s in manifest for r in s["rules"] if r["status"] == "ok")
+          notes_dir = pathlib.Path("notes")
+          notes_dir.mkdir(parents=True, exist_ok=True)
 
-          lines = [
-              "## Build Info",
-              f"- **Updated:** {now_cst:%Y-%m-%d %H:%M} (UTC+8) / {now_utc:%Y-%m-%d %H:%M} UTC",
-              f"- **Mihomo Version:** `{mihomo_version}`",
-              f"- **Total MRS Rules:** {total_mrs}",
-              "",
-              "## 订阅线路说明",
-              "以下以 `direct.mrs` 为例，将末尾文件名替换为下方任意 `.mrs` 文件名即可使用：",
-              "",
-              f"- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/{gh_repo}/releases/latest/download/direct.mrs",
-              f"- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/{gh_repo}/release/direct.mrs",
-              f"- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/{gh_repo}@release/direct.mrs",
-              "",
-              "## 规则来源与文件清单",
-              "",
-          ]
-
-          for idx, src in enumerate(manifest, 1):
-              lines.append(f"### {idx}. {src['name']}")
-              lines.append(f"- **来源：** {src['repo_url']}")
-              lines.append(f"- **说明：** {src['description']}")
-              lines.append("")
-              lines.append("| MRS 文件 | 类型 | 条目数 | 大小 | 说明与原始文件 | 订阅地址 |")
-              lines.append("| :--- | :---: | ---: | ---: | :--- | :---: |")
+          def render_rule_table(src: dict) -> list[str]:
+              tag = src["tag"]
+              sid = src["id"]
+              rows = [
+                  "| MRS 文件 | 类型 | 条目数 | 大小 | 说明与原始文件 | 订阅地址 |",
+                  "| :--- | :---: | ---: | ---: | :--- | :---: |",
+              ]
               for r in src["rules"]:
                   mrs = r["mrs"]
                   desc_cell = f"{r['desc']}（[{r['src_name']}]({r['url']})）"
@@ -720,22 +753,102 @@ jobs:
                       desc_cell += f" · 已过滤 {r['skipped']} 条非 MRS 规则"
                   count_cell = f"{r['count']:,}" if isinstance(r.get("count"), int) else "-"
                   if r["status"] == "ok":
-                      rel_url = f"https://github.com/{gh_repo}/releases/latest/download/{mrs}"
-                      raw_url = f"https://raw.githubusercontent.com/{gh_repo}/release/{mrs}"
-                      cdn_url = f"https://cdn.jsdelivr.net/gh/{gh_repo}@release/{mrs}"
+                      rel_url = f"https://github.com/{gh_repo}/releases/download/{tag}/{mrs}"
+                      raw_url = f"https://raw.githubusercontent.com/{gh_repo}/release/{sid}/{mrs}"
+                      cdn_url = f"https://cdn.jsdelivr.net/gh/{gh_repo}@release/{sid}/{mrs}"
                       links = f"[Releases]({rel_url}) · [Raw]({raw_url}) · [CDN]({cdn_url})"
-                      lines.append(f"| `{mrs}` | `{r['behavior']}` | {count_cell} | {r['size']} | {desc_cell} | {links} |")
+                      rows.append(f"| `{mrs}` | `{r['behavior']}` | {count_cell} | {r['size']} | {desc_cell} | {links} |")
                   else:
-                      lines.append(f"| `{mrs}` | `{r['behavior']}` | 0 | - | {desc_cell} | 当日上游无有效条目 |")
+                      rows.append(f"| `{mrs}` | `{r['behavior']}` | 0 | - | {desc_cell} | 当日上游无有效条目 |")
+              return rows
 
-              if src["extras"]:
-                  lines.append("")
-                  lines.append("**其他原文件（非 MRS，请直接引用上游地址）：**")
-                  for ex in src["extras"]:
-                      lines.append(f"- **{ex['name']}**：{ex['url']}  \n  {ex['note']}")
+          def render_extras(src: dict) -> list[str]:
+              if not src["extras"]:
+                  return []
+              out = ["", "**其他原文件（非 MRS，请直接引用上游地址）：**"]
+              for ex in src["extras"]:
+                  out.append(f"- **{ex['name']}**：{ex['url']}  \n  {ex['note']}")
+              return out
+
+          # 1. Per-source Release Notes (cleanly separated per Release)
+          for src in manifest:
+              tag = src["tag"]
+              sid = src["id"]
+              sample = src["sample_mrs"]
+              ok_count = sum(1 for r in src["rules"] if r["status"] == "ok")
+              other_links = " · ".join(
+                  f"[`{other['tag']}`](https://github.com/{gh_repo}/releases/tag/{other['tag']})"
+                  for other in manifest
+                  if other["tag"] != tag
+              )
+
+              lines = [
+                  "## Build Info",
+                  f"- **Updated:** {time_str}",
+                  f"- **Mihomo Version:** `{mihomo_version}`",
+                  f"- **MRS Rules:** {ok_count}",
+                  f"- **其他规则发布页：** {other_links}",
+                  "",
+                  "## 来源说明",
+                  f"- **上游仓库：** {src['repo_url']}",
+                  f"- **简介：** {src['description']}",
+                  "",
+                  "## 订阅线路说明",
+                  f"以下以 `{sample}` 为例，将末尾文件名替换为下方任意 `.mrs` 文件名即可使用：",
+                  "",
+                  f"- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/{gh_repo}/releases/download/{tag}/{sample}",
+                  f"- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/{gh_repo}/release/{sid}/{sample}",
+                  f"- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/{gh_repo}@release/{sid}/{sample}",
+                  "",
+                  "## 规则文件清单",
+                  "",
+              ]
+              lines.extend(render_rule_table(src))
+              lines.extend(render_extras(src))
               lines.append("")
+              (notes_dir / f"{tag}.md").write_text("\n".join(lines), encoding="utf-8")
 
-          pathlib.Path("release_notes.md").write_text("\n".join(lines), encoding="utf-8")
+          # 2. Master README for the orphan release branch & workflow summary
+          total_mrs = sum(1 for s in manifest for r in s["rules"] if r["status"] == "ok")
+          master = [
+              "# Loyalsoldier Rules (MRS)",
+              "",
+              "## Build Info",
+              f"- **Updated:** {time_str}",
+              f"- **Mihomo Version:** `{mihomo_version}`",
+              f"- **Total MRS Rules:** {total_mrs}",
+              "",
+              "## 订阅线路说明（按来源分目录 / 独立 Release）",
+              "以下以 `clash-rules` 来源的 `direct.mrs` 为例，切换来源时同步替换目录名 / Release 标签（`clash-rules`、`v2ray-rules-dat`、`cn-blocked-domain`）：",
+              "",
+              f"- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/{gh_repo}/releases/download/clash-rules/direct.mrs",
+              f"- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/{gh_repo}/release/clash-rules/direct.mrs",
+              f"- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/{gh_repo}@release/clash-rules/direct.mrs",
+              "",
+              "## 独立发布页导航",
+          ]
+          for src in manifest:
+              ok_count = sum(1 for r in src["rules"] if r["status"] == "ok")
+              master.append(
+                  f"- **{src['name']}**（{ok_count} 个 MRS）："
+                  f"[Release `{src['tag']}`](https://github.com/{gh_repo}/releases/tag/{src['tag']}) · "
+                  f"分支目录 `{src['id']}/`"
+              )
+          master.append("")
+          master.append("## 规则来源与文件清单")
+          master.append("")
+
+          for idx, src in enumerate(manifest, 1):
+              master.append(f"### {idx}. {src['name']}")
+              master.append(f"- **来源：** {src['repo_url']}")
+              master.append(f"- **独立发布页：** https://github.com/{gh_repo}/releases/tag/{src['tag']}")
+              master.append(f"- **说明：** {src['description']}")
+              master.append("")
+              master.extend(render_rule_table(src))
+              master.extend(render_extras(src))
+              master.append("")
+
+          pathlib.Path("branch_readme.md").write_text("\n".join(master), encoding="utf-8")
           PY
 
       - name: Publish to orphan release branch
@@ -746,7 +859,7 @@ jobs:
           set -euo pipefail
           mkdir -p publish_branch
           cp -a out/. publish_branch/
-          cp -f release_notes.md publish_branch/README.md
+          cp -f branch_readme.md publish_branch/README.md
           cd publish_branch
           git init -b release
           git config user.name "github-actions[bot]"
@@ -758,13 +871,16 @@ jobs:
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${BASIC_AUTH}" \
             push --force "https://github.com/${GITHUB_REPOSITORY}.git" release:release
 
-      - name: Sync to GitHub Releases (latest)
-        if: steps.diff.outputs.release_changed == 'true'
+      - name: Sync independent GitHub Releases
+        if: steps.diff.outputs.any_release_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          CHANGED_RELEASES: ${{ steps.diff.outputs.changed_releases }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+
           retry_cmd() {
             local attempt=1
             local max_attempts=3
@@ -779,45 +895,74 @@ jobs:
             done
           }
 
-          if gh release view latest --repo "$GH_REPO" >/dev/null 2>&1; then
-            retry_cmd gh release upload latest out/*.mrs out/checksums.sha256 --repo "$GH_REPO" --clobber
-            gh release view latest --repo "$GH_REPO" --json assets -q '.assets[].name' | while IFS= read -r asset; do
-              [ -z "$asset" ] && continue
-              if [ ! -f "out/${asset}" ]; then
-                echo "Removing stale release asset: ${asset}"
-                retry_cmd gh release delete-asset latest "${asset}" --repo "$GH_REPO" --yes
-              fi
-            done
-            retry_cmd gh release edit latest --repo "$GH_REPO" --latest --notes-file release_notes.md
-          else
-            DEFAULT_BRANCH=$(gh api "repos/${GH_REPO}" --jq '.default_branch')
-            retry_cmd gh release create latest out/*.mrs out/checksums.sha256 \
-              --repo "$GH_REPO" \
-              --target "$DEFAULT_BRANCH" \
-              --title "Latest MRS Rules" \
-              --latest \
-              --notes-file release_notes.md
-          fi
+          DEFAULT_BRANCH=$(gh api "repos/${GH_REPO}" --jq '.default_branch')
+
+          for tag in $CHANGED_RELEASES; do
+            case "$tag" in
+              clash-rules)
+                TITLE="Loyalsoldier/clash-rules (MRS)"
+                LATEST_FLAG="--latest"
+                ;;
+              v2ray-rules-dat)
+                TITLE="Loyalsoldier/v2ray-rules-dat (MRS)"
+                LATEST_FLAG="--latest=false"
+                ;;
+              cn-blocked-domain)
+                TITLE="Loyalsoldier/cn-blocked-domain (MRS)"
+                LATEST_FLAG="--latest=false"
+                ;;
+              *)
+                echo "Unknown release tag: ${tag}"
+                exit 1
+                ;;
+            esac
+
+            ASSETS=( "out/${tag}"/*.mrs "out/${tag}/checksums.sha256" )
+            NOTES_FILE="notes/${tag}.md"
+            echo "=== Syncing Release [${tag}] (${#ASSETS[@]} files) ==="
+
+            if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+              retry_cmd gh release upload "$tag" "${ASSETS[@]}" --repo "$GH_REPO" --clobber
+              gh release view "$tag" --repo "$GH_REPO" --json assets -q '.assets[].name' | while IFS= read -r asset; do
+                [ -z "$asset" ] && continue
+                if [ ! -f "out/${tag}/${asset}" ]; then
+                  echo "Removing stale release asset from [${tag}]: ${asset}"
+                  retry_cmd gh release delete-asset "$tag" "${asset}" --repo "$GH_REPO" --yes
+                fi
+              done
+              retry_cmd gh release edit "$tag" --repo "$GH_REPO" \
+                --title "$TITLE" \
+                "$LATEST_FLAG" \
+                --notes-file "$NOTES_FILE"
+            else
+              retry_cmd gh release create "$tag" "${ASSETS[@]}" \
+                --repo "$GH_REPO" \
+                --target "$DEFAULT_BRANCH" \
+                --title "$TITLE" \
+                "$LATEST_FLAG" \
+                --notes-file "$NOTES_FILE"
+            fi
+          done
 
       - name: Write workflow summary
         if: always()
         env:
           BRANCH_CHANGED: ${{ steps.diff.outputs.branch_changed }}
-          RELEASE_CHANGED: ${{ steps.diff.outputs.release_changed }}
+          CHANGED_RELEASES: ${{ steps.diff.outputs.changed_releases }}
         run: |
           set -euo pipefail
           [ -f build_manifest.json ] || exit 0
           BRANCH_STATUS="无变化（跳过）"
           [ "$BRANCH_CHANGED" = "true" ] && BRANCH_STATUS="已更新"
           RELEASE_STATUS="无变化（跳过）"
-          [ "$RELEASE_CHANGED" = "true" ] && RELEASE_STATUS="已更新"
+          [ -n "$CHANGED_RELEASES" ] && RELEASE_STATUS="已更新 (${CHANGED_RELEASES})"
           {
             printf '%s\n' '## MRS 构建摘要'
             printf -- '- **Mihomo 版本：** `%s`\n' "${MIHOMO_VERSION:-unknown}"
             printf -- '- **孤儿分支 (`release`)：** %s\n' "$BRANCH_STATUS"
-            printf -- '- **GitHub Releases (`latest`)：** %s\n' "$RELEASE_STATUS"
+            printf -- '- **独立 Releases：** %s\n' "$RELEASE_STATUS"
             printf '\n'
-            if [ -f release_notes.md ]; then
-              cat release_notes.md
+            if [ -f branch_readme.md ]; then
+              cat branch_readme.md
             fi
           } >> "$GITHUB_STEP_SUMMARY"
