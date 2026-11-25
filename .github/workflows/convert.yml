@@ -1,0 +1,151 @@
+name: Convert Loyalsoldier Rules to MRS
+
+on:
+  schedule:
+    - cron: "0 23 * * *" # UTC 23:00 ≈ 北京时间 07:00
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "即使规则无变化也强制重新发布"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: convert-mrs
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download mihomo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RELEASE_JSON=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
+          MIHOMO_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          URL=$(echo "$RELEASE_JSON" | jq -r '
+            (.assets[] | select(.name | test("^mihomo-linux-amd64-compatible-v.*\\.gz$")) | .browser_download_url),
+            (.assets[] | select(.name | test("^mihomo-linux-amd64-v.*\\.gz$")) | .browser_download_url)
+          ' | head -n 1)
+
+          [ -n "$URL" ] && [ "$URL" != "null" ] || { echo "Failed to resolve mihomo URL"; exit 1; }
+          echo "MIHOMO_VERSION=$MIHOMO_VERSION" >> "$GITHUB_ENV"
+          echo "Downloading mihomo ${MIHOMO_VERSION}..."
+          curl -fsSL --retry 3 --retry-delay 2 "$URL" -o mihomo.gz
+          gunzip -f mihomo.gz
+          chmod +x mihomo
+          ./mihomo -v
+
+      - name: Download, Convert & Verify
+        run: |
+          set -euo pipefail
+          mkdir -p raw out
+          BASE="https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release"
+          DOMAIN_RULES=(direct proxy reject private apple icloud google gfw tld-not-cn)
+          IP_RULES=(telegramcidr lancidr cncidr)
+
+          for f in "${DOMAIN_RULES[@]}"; do
+            curl -fsSL --retry 3 --retry-delay 2 -o "raw/${f}.txt" "${BASE}/${f}.txt"
+            [ -s "raw/${f}.txt" ] || { echo "Empty source: ${f}.txt"; exit 1; }
+            ./mihomo convert-ruleset domain yaml "raw/${f}.txt" "out/${f}.mrs"
+            [ -s "out/${f}.mrs" ] || { echo "Empty output: ${f}.mrs"; exit 1; }
+          done
+
+          for f in "${IP_RULES[@]}"; do
+            curl -fsSL --retry 3 --retry-delay 2 -o "raw/${f}.txt" "${BASE}/${f}.txt"
+            [ -s "raw/${f}.txt" ] || { echo "Empty source: ${f}.txt"; exit 1; }
+            ./mihomo convert-ruleset ipcidr yaml "raw/${f}.txt" "out/${f}.mrs"
+            [ -s "out/${f}.mrs" ] || { echo "Empty output: ${f}.mrs"; exit 1; }
+          done
+
+          (cd out && sha256sum *.mrs | LC_ALL=C sort -k2 > checksums.sha256)
+
+      - name: Detect changes
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_PUBLISH: ${{ inputs.force_publish || github.event.inputs.force_publish || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE_PUBLISH" = "true" ]; then
+            echo "Force publish enabled."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git clone --depth 1 --branch release \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" prev 2>/dev/null; then
+            if [ -f prev/checksums.sha256 ] && cmp -s prev/checksums.sha256 out/checksums.sha256; then
+              echo "No rule changes detected, skipping publish."
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Rule changes detected (or first run)."
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to orphan release branch
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p publish_branch
+          cp -a out/. publish_branch/
+          cd publish_branch
+          git init -b release
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: update MRS rules $(date -u '+%Y-%m-%d %H:%M UTC') (${MIHOMO_VERSION})"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" release:release
+
+      - name: Sync to GitHub Releases (latest)
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M UTC')
+          {
+            printf '%s\n' '## Build Info'
+            printf -- '- **Updated:** %s\n' "$BUILD_TIME"
+            printf -- '- **Mihomo Version:** `%s`\n' "$MIHOMO_VERSION"
+            printf -- '- **Source:** `Loyalsoldier/clash-rules@release`\n'
+            printf '\n'
+            printf '%s\n' '## Assets'
+            printf '%s\n' '| File | Size |'
+            printf '%s\n' '| :--- | ---: |'
+            for file in out/*.mrs; do
+              name=$(basename "$file")
+              size=$(du -h "$file" | cut -f1)
+              printf -- '| `%s` | %s |\n' "$name" "$size"
+            done
+          } > release_notes.md
+
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest out/*.mrs out/checksums.sha256 --clobber
+            gh release view latest --json assets -q '.assets[].name' | while IFS= read -r asset; do
+              [ -z "$asset" ] && continue
+              if [ ! -f "out/${asset}" ]; then
+                echo "Removing stale release asset: ${asset}"
+                gh release delete-asset latest "${asset}" --yes
+              fi
+            done
+            gh release edit latest --latest --notes-file release_notes.md
+          else
+            DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
+            gh release create latest out/*.mrs out/checksums.sha256 \
+              --target "$DEFAULT_BRANCH" \
+              --title "Latest MRS Rules" \
+              --latest \
+              --notes-file release_notes.md
+          fi
