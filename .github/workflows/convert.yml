@@ -32,9 +32,14 @@ jobs:
           REQ_VERSION: ${{ inputs.mihomo_version || github.event.inputs.mihomo_version || 'latest' }}
         run: |
           set -euo pipefail
-          if [ "$REQ_VERSION" = "latest" ] || [ -z "$REQ_VERSION" ]; then
+          REQ_VERSION="$(printf '%s' "$REQ_VERSION" | xargs)"
+          if [ -z "$REQ_VERSION" ] || [ "$REQ_VERSION" = "latest" ]; then
             API_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
           else
+            if [[ ! "$REQ_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "Invalid mihomo_version input: ${REQ_VERSION}"
+              exit 1
+            fi
             API_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${REQ_VERSION}"
           fi
 
@@ -44,16 +49,21 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "$API_URL")
 
-          MIHOMO_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
-          URL=$(echo "$RELEASE_JSON" | jq -r '
-            (.assets[] | select(.name | test("^mihomo-linux-amd64-compatible-v.*\\.gz$")) | .browser_download_url),
-            (.assets[] | select(.name | test("^mihomo-linux-amd64-v.*\\.gz$")) | .browser_download_url)
-          ' | head -n 1)
+          MIHOMO_VERSION=$(jq -r '.tag_name // empty' <<< "$RELEASE_JSON")
+          URL=$(jq -r '
+            (
+              [.assets[] | select(.name | test("^mihomo-linux-amd64-compatible-v.*\\.gz$")) | .browser_download_url]
+              + [.assets[] | select(.name | test("^mihomo-linux-amd64-v.*\\.gz$")) | .browser_download_url]
+            ) | first // empty
+          ' <<< "$RELEASE_JSON")
 
-          [ -n "$MIHOMO_VERSION" ] || { echo "Failed to resolve mihomo version"; exit 1; }
-          [ -n "$URL" ] && [ "$URL" != "null" ] || { echo "Failed to resolve mihomo download URL"; exit 1; }
+          if [[ ! "$MIHOMO_VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Failed to resolve valid mihomo version: ${MIHOMO_VERSION}"
+            exit 1
+          fi
+          [ -n "$URL" ] || { echo "Failed to resolve mihomo download URL"; exit 1; }
 
-          echo "MIHOMO_VERSION=$MIHOMO_VERSION" >> "$GITHUB_ENV"
+          printf 'MIHOMO_VERSION=%s\n' "$MIHOMO_VERSION" >> "$GITHUB_ENV"
           echo "Downloading mihomo ${MIHOMO_VERSION}..."
           curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
             --connect-timeout 15 --max-time 120 \
@@ -70,6 +80,7 @@ jobs:
           import hashlib
           import ipaddress
           import json
+          import os
           import pathlib
           import re
           import subprocess
@@ -81,6 +92,7 @@ jobs:
           for d in (RAW_DIR, CLEAN_DIR, OUT_DIR):
               d.mkdir(parents=True, exist_ok=True)
 
+          # Single source of truth for sources, tags, titles, latest pointer, and rules
           SOURCES = [
               {
                   "id": "clash-rules",
@@ -356,26 +368,43 @@ jobs:
           ]
 
           LABEL_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
+          ASCII_DOMAIN_RE = re.compile(
+              r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)*$"
+          )
+          IPV4_LIKE_RE = re.compile(r"^\d+(?:\.\d+){3}$")
           CLASH_ITEM_RE = re.compile(r"^\s*-\s+\S+")
           BRACKET_IP_RE = re.compile(r"^\[([^\]]+)\](?::\d+)?$")
 
           def normalize_domain(domain: str) -> str | None:
               domain = domain.strip().strip(".").lower()
-              if not domain:
+              if not domain or len(domain) > 253:
                   return None
-              try:
-                  ascii_domain = domain.encode("idna").decode("ascii").lower()
-              except UnicodeError:
-                  return None
-              if not ascii_domain or len(ascii_domain) > 253:
-                  return None
-              try:
-                  ipaddress.ip_address(ascii_domain)
-                  return None
-              except ValueError:
-                  pass
-              labels = ascii_domain.split(".")
-              if any(not LABEL_RE.fullmatch(lbl) for lbl in labels):
+              # Fast path for pure ASCII domains (99.9%+ of entries; avoids slow pure-Python IDNA codec)
+              if domain.isascii():
+                  if not ASCII_DOMAIN_RE.fullmatch(domain):
+                      return None
+                  if IPV4_LIKE_RE.fullmatch(domain):
+                      try:
+                          ipaddress.ip_address(domain)
+                          return None
+                      except ValueError:
+                          pass
+                  return domain
+
+              out_labels = []
+              for lbl in domain.split("."):
+                  if not lbl:
+                      return None
+                  if not lbl.isascii():
+                      try:
+                          lbl = lbl.encode("idna").decode("ascii").lower()
+                      except UnicodeError:
+                          return None
+                  if not LABEL_RE.fullmatch(lbl):
+                      return None
+                  out_labels.append(lbl)
+              ascii_domain = ".".join(out_labels)
+              if len(ascii_domain) > 253:
                   return None
               return ascii_domain
 
@@ -406,7 +435,7 @@ jobs:
                   elif CLASH_ITEM_RE.match(line):
                       count += 1
               if not has_payload or count == 0:
-                  sys.exit(f"Invalid or empty Clash YAML ruleset: {src}")
+                  raise RuntimeError(f"Invalid or empty Clash YAML ruleset: {src}")
               return count
 
           def preprocess_plain_domain(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int, list[str]]:
@@ -535,6 +564,68 @@ jobs:
                   size /= 1024
               return f"{num_bytes} B"
 
+          def process_rule(sid: str, rule: dict) -> dict:
+              out_stem = rule["out"]
+              mrs_name = f"{out_stem}.mrs"
+              raw_path = RAW_DIR / sid / f"{out_stem}.txt"
+              src_out_dir = OUT_DIR / sid
+              src_out_dir.mkdir(parents=True, exist_ok=True)
+              out_path = src_out_dir / mrs_name
+              allow_empty = rule.get("allow_empty", False)
+
+              mode = rule["mode"]
+              skipped = 0
+              samples: list[str] = []
+              if mode == "clash_yaml":
+                  count = validate_clash_yaml(raw_path)
+                  src_for_mihomo = raw_path
+                  mihomo_fmt = "yaml"
+              else:
+                  clean_path = CLEAN_DIR / sid / f"{out_stem}.txt"
+                  if mode == "plain_domain":
+                      count, skipped, samples = preprocess_plain_domain(raw_path, clean_path)
+                  elif mode == "v2ray_domain":
+                      count, skipped, samples = preprocess_v2ray_domain(raw_path, clean_path)
+                  elif mode == "plain_ip":
+                      count, skipped, samples = preprocess_plain_ip(raw_path, clean_path)
+                  else:
+                      raise RuntimeError(f"Unknown mode: {mode}")
+
+                  if count == 0:
+                      raw_bytes = raw_path.stat().st_size
+                      diag = f"raw_bytes={raw_bytes}, skipped={skipped}, samples={samples}"
+                      if allow_empty:
+                          print(f"  WARN: [{sid}] {rule['src_name']} has 0 valid entries ({diag}), skipping MRS.")
+                          return {
+                              **rule,
+                              "mrs": mrs_name,
+                              "status": "empty",
+                              "size": "-",
+                              "count": 0,
+                              "skipped": skipped,
+                          }
+                      raise RuntimeError(f"Zero valid entries after preprocessing ({diag}): {rule['url']}")
+                  src_for_mihomo = clean_path
+                  mihomo_fmt = "text"
+
+              subprocess.run(
+                  ["./mihomo", "convert-ruleset", rule["behavior"], mihomo_fmt, str(src_for_mihomo), str(out_path)],
+                  check=True,
+              )
+              if not out_path.exists() or out_path.stat().st_size == 0:
+                  raise RuntimeError(f"Empty MRS output: {out_path}")
+
+              size_str = human_size(out_path.stat().st_size)
+              print(f"  OK: {sid}/{mrs_name} ({count} rules, {size_str}, skipped={skipped})")
+              return {
+                  **rule,
+                  "mrs": mrs_name,
+                  "status": "ok",
+                  "size": size_str,
+                  "count": count,
+                  "skipped": skipped,
+              }
+
           # 1. Parallel download into per-source subdirectories (no filename collisions)
           download_tasks = [
               (rule["url"], RAW_DIR / source["id"] / f"{rule['out']}.txt", source["id"], rule["src_name"])
@@ -542,7 +633,7 @@ jobs:
               for rule in source["rules"]
           ]
           print(f"Downloading {len(download_tasks)} upstream rule files in parallel...")
-          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
               futures = {
                   pool.submit(download, url, dest): (sid, sname, url)
                   for url, dest, sid, sname in download_tasks
@@ -555,88 +646,35 @@ jobs:
                   except Exception as exc:
                       sys.exit(f"Failed downloading [{sid}] {sname} ({url}): {exc}")
 
-          # 2. Deterministic preprocess, convert & verify per source
+          # 2. Parallel preprocess & mihomo convert across CPU cores, reassembled in deterministic order
+          cpu_workers = max(2, min(4, os.cpu_count() or 4))
+          print(f"Converting rules with {cpu_workers} parallel workers...")
+          indexed_tasks = [
+              (s_idx, r_idx, source["id"], rule)
+              for s_idx, source in enumerate(SOURCES)
+              for r_idx, rule in enumerate(source["rules"])
+          ]
+          results_map: dict[tuple[int, int], dict] = {}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=cpu_workers) as pool:
+              futures = {
+                  pool.submit(process_rule, sid, rule): (s_idx, r_idx, sid, rule["src_name"])
+                  for s_idx, r_idx, sid, rule in indexed_tasks
+              }
+              for fut in concurrent.futures.as_completed(futures):
+                  s_idx, r_idx, sid, sname = futures[fut]
+                  try:
+                      results_map[(s_idx, r_idx)] = fut.result()
+                  except Exception as exc:
+                      sys.exit(f"Failed converting [{sid}] {sname}: {exc}")
+
+          # 3. Deterministic manifest & per-source + global SHA256 checksums
           manifest = []
           global_checksum_lines = []
-          for source in SOURCES:
+          for s_idx, source in enumerate(SOURCES):
               sid = source["id"]
               src_out_dir = OUT_DIR / sid
-              src_out_dir.mkdir(parents=True, exist_ok=True)
-              src_entry = {
-                  "id": sid,
-                  "tag": source["tag"],
-                  "title": source["title"],
-                  "is_latest": source["is_latest"],
-                  "name": source["name"],
-                  "repo_url": source["repo_url"],
-                  "sample_mrs": source["sample_mrs"],
-                  "description": source["description"],
-                  "rules": [],
-                  "extras": source["extras"],
-              }
+              src_rules = [results_map[(s_idx, r_idx)] for r_idx in range(len(source["rules"]))]
 
-              for rule in source["rules"]:
-                  out_stem = rule["out"]
-                  mrs_name = f"{out_stem}.mrs"
-                  raw_path = RAW_DIR / sid / f"{out_stem}.txt"
-                  out_path = src_out_dir / mrs_name
-                  allow_empty = rule.get("allow_empty", False)
-
-                  mode = rule["mode"]
-                  skipped = 0
-                  samples: list[str] = []
-                  if mode == "clash_yaml":
-                      count = validate_clash_yaml(raw_path)
-                      src_for_mihomo = raw_path
-                      mihomo_fmt = "yaml"
-                  else:
-                      clean_path = CLEAN_DIR / sid / f"{out_stem}.txt"
-                      if mode == "plain_domain":
-                          count, skipped, samples = preprocess_plain_domain(raw_path, clean_path)
-                      elif mode == "v2ray_domain":
-                          count, skipped, samples = preprocess_v2ray_domain(raw_path, clean_path)
-                      elif mode == "plain_ip":
-                          count, skipped, samples = preprocess_plain_ip(raw_path, clean_path)
-                      else:
-                          sys.exit(f"Unknown mode: {mode}")
-
-                      if count == 0:
-                          raw_bytes = raw_path.stat().st_size
-                          diag = f"raw_bytes={raw_bytes}, skipped={skipped}, samples={samples}"
-                          if allow_empty:
-                              print(f"  WARN: [{sid}] {rule['src_name']} has 0 valid entries ({diag}), skipping MRS.")
-                              src_entry["rules"].append({
-                                  **rule,
-                                  "mrs": mrs_name,
-                                  "status": "empty",
-                                  "size": "-",
-                                  "count": 0,
-                                  "skipped": skipped,
-                              })
-                              continue
-                          sys.exit(f"Zero valid entries after preprocessing ({diag}): {rule['url']}")
-                      src_for_mihomo = clean_path
-                      mihomo_fmt = "text"
-
-                  subprocess.run(
-                      ["./mihomo", "convert-ruleset", rule["behavior"], mihomo_fmt, str(src_for_mihomo), str(out_path)],
-                      check=True,
-                  )
-                  if not out_path.exists() or out_path.stat().st_size == 0:
-                      sys.exit(f"Empty MRS output: {out_path}")
-
-                  size_str = human_size(out_path.stat().st_size)
-                  print(f"  OK: {sid}/{mrs_name} ({count} rules, {size_str}, skipped={skipped})")
-                  src_entry["rules"].append({
-                      **rule,
-                      "mrs": mrs_name,
-                      "status": "ok",
-                      "size": size_str,
-                      "count": count,
-                      "skipped": skipped,
-                  })
-
-              # Per-source checksums.sha256 (used by each independent Release)
               src_checksums = []
               for mrs_file in sorted(src_out_dir.glob("*.mrs"), key=lambda p: p.name):
                   digest = hashlib.sha256(mrs_file.read_bytes()).hexdigest()
@@ -645,9 +683,20 @@ jobs:
               if not src_checksums:
                   sys.exit(f"Source {sid} produced 0 MRS files")
               (src_out_dir / "checksums.sha256").write_text("\n".join(src_checksums) + "\n", encoding="utf-8")
-              manifest.append(src_entry)
 
-          # Global checksums.sha256 (used by the orphan release branch)
+              manifest.append({
+                  "id": sid,
+                  "tag": source["tag"],
+                  "title": source["title"],
+                  "is_latest": source["is_latest"],
+                  "name": source["name"],
+                  "repo_url": source["repo_url"],
+                  "sample_mrs": source["sample_mrs"],
+                  "description": source["description"],
+                  "rules": src_rules,
+                  "extras": source["extras"],
+              })
+
           global_checksum_lines.sort(key=lambda line: line.split("  ", 1)[1])
           (OUT_DIR / "checksums.sha256").write_text("\n".join(global_checksum_lines) + "\n", encoding="utf-8")
           pathlib.Path("build_manifest.json").write_text(
@@ -664,58 +713,98 @@ jobs:
           FORCE_PUBLISH: ${{ inputs.force_publish || github.event.inputs.force_publish || 'false' }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
 
-          # Publish order: non-latest releases first, primary (clash-rules) last
-          TAGS=(cn-blocked-domain v2ray-rules-dat clash-rules)
+          gh_token = os.environ["GH_TOKEN"]
+          gh_repo = os.environ["GH_REPO"]
+          force_publish = os.environ.get("FORCE_PUBLISH", "false").lower() == "true"
+          manifest = json.loads(pathlib.Path("build_manifest.json").read_text(encoding="utf-8"))
 
-          if [ "$FORCE_PUBLISH" = "true" ]; then
-            echo "Force publish enabled for orphan branch and all releases."
-            echo "branch_changed=true" >> "$GITHUB_OUTPUT"
-            echo "changed_releases=${TAGS[*]}" >> "$GITHUB_OUTPUT"
-            echo "any_release_changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          # Non-latest releases first, is_latest release last
+          ordered_sources = sorted(manifest, key=lambda s: (bool(s["is_latest"]), s["tag"]))
 
-          # 1. Check orphan release branch via lightweight Contents API
-          branch_changed=true
-          if gh api -H "Accept: application/vnd.github.raw+json" \
-            "repos/${GH_REPO}/contents/checksums.sha256?ref=release" > prev_branch.sha256 2>/dev/null; then
-            if cmp -s prev_branch.sha256 out/checksums.sha256; then
-              branch_changed=false
-            fi
-          fi
+          def api_get(url: str, accept: str = "application/vnd.github+json") -> tuple[int, bytes]:
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {gh_token}",
+                      "Accept": accept,
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "clash-rules-mrs-workflow",
+                  },
+              )
+              for attempt in range(1, 4):
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as resp:
+                          return resp.status, resp.read()
+                  except urllib.error.HTTPError as exc:
+                      if exc.code == 404:
+                          return 404, b""
+                      if exc.code >= 500 or exc.code == 429:
+                          if attempt < 3:
+                              time.sleep(2 * attempt)
+                              continue
+                      raise RuntimeError(f"GitHub API HTTP {exc.code} for {url}: {exc.read().decode('utf-8', 'ignore')[:300]}")
+                  except urllib.error.URLError as exc:
+                      if attempt < 3:
+                          time.sleep(2 * attempt)
+                          continue
+                      raise RuntimeError(f"GitHub API network error for {url}: {exc}")
+              raise RuntimeError(f"Unreachable retry state for {url}")
 
-          # 2. Check each of the 3 Releases independently
-          changed_list=()
-          for tag in "${TAGS[@]}"; do
-            rel_changed=true
-            if gh release download "$tag" --repo "$GH_REPO" \
-              --pattern "checksums.sha256" --output "prev_${tag}.sha256" 2>/dev/null; then
-              if cmp -s "prev_${tag}.sha256" "out/${tag}/checksums.sha256"; then
-                (cd "out/${tag}" && ls -1 *.mrs checksums.sha256 | LC_ALL=C sort) > "expected_${tag}.txt"
-                gh release view "$tag" --repo "$GH_REPO" --json assets -q '.assets[].name' | LC_ALL=C sort > "remote_${tag}.txt"
-                if cmp -s "expected_${tag}.txt" "remote_${tag}.txt"; then
-                  rel_changed=false
-                fi
-              fi
-            fi
-            echo "release[${tag}]_changed=${rel_changed}"
-            if [ "$rel_changed" = "true" ]; then
-              changed_list+=("$tag")
-            fi
-          done
+          if force_publish:
+              branch_changed = True
+              changed_tags = [s["tag"] for s in ordered_sources]
+              print("Force publish enabled for orphan branch and all releases.")
+          else:
+              # 1. Check orphan release branch via single lightweight Contents API call
+              local_global = pathlib.Path("out/checksums.sha256").read_bytes()
+              status, remote_global = api_get(
+                  f"https://api.github.com/repos/{gh_repo}/contents/checksums.sha256?ref=release",
+                  accept="application/vnd.github.raw+json",
+              )
+              branch_changed = (status == 404) or (remote_global != local_global)
 
-          any_release_changed=false
-          if [ "${#changed_list[@]}" -gt 0 ]; then
-            any_release_changed=true
-          fi
+              # 2. Check each Release independently (1 metadata call + 1 small checksum download)
+              changed_tags = []
+              for src in ordered_sources:
+                  tag = src["tag"]
+                  sid = src["id"]
+                  src_dir = pathlib.Path("out") / sid
+                  local_sha = (src_dir / "checksums.sha256").read_bytes()
+                  expected_assets = sorted([*(p.name for p in src_dir.glob("*.mrs")), "checksums.sha256"])
 
-          echo "branch_changed=${branch_changed}"
-          echo "changed_releases=${changed_list[*]}"
-          echo "branch_changed=${branch_changed}" >> "$GITHUB_OUTPUT"
-          echo "changed_releases=${changed_list[*]}" >> "$GITHUB_OUTPUT"
-          echo "any_release_changed=${any_release_changed}" >> "$GITHUB_OUTPUT"
+                  status, body = api_get(f"https://api.github.com/repos/{gh_repo}/releases/tags/{tag}")
+                  rel_changed = True
+                  if status == 200:
+                      rel = json.loads(body.decode("utf-8"))
+                      assets = rel.get("assets", [])
+                      remote_names = sorted(a["name"] for a in assets)
+                      sha_asset = next((a for a in assets if a["name"] == "checksums.sha256"), None)
+                      if remote_names == expected_assets and sha_asset is not None:
+                          sha_status, remote_sha = api_get(sha_asset["url"], accept="application/octet-stream")
+                          if sha_status == 200 and remote_sha == local_sha:
+                              rel_changed = False
+                  print(f"release[{tag}]_changed={'true' if rel_changed else 'false'}")
+                  if rel_changed:
+                      changed_tags.append(tag)
+
+          any_release_changed = len(changed_tags) > 0
+          print(f"branch_changed={'true' if branch_changed else 'false'}")
+          print(f"changed_releases={' '.join(changed_tags)}")
+
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as fh:
+              fh.write(f"branch_changed={'true' if branch_changed else 'false'}\n")
+              fh.write(f"changed_releases={' '.join(changed_tags)}\n")
+              fh.write(f"any_release_changed={'true' if any_release_changed else 'false'}\n")
+          PY
 
       - name: Generate release notes & branch README
         if: steps.diff.outputs.branch_changed == 'true' || steps.diff.outputs.any_release_changed == 'true'
@@ -770,7 +859,7 @@ jobs:
                   out.append(f"- **{ex['name']}**：{ex['url']}  \n  {ex['note']}")
               return out
 
-          # 1. Per-source Release Notes (cleanly separated per Release)
+          # 1. Per-source Release Notes
           for src in manifest:
               tag = src["tag"]
               sid = src["id"]
@@ -868,8 +957,18 @@ jobs:
           git commit -m "chore: update MRS rules $(date -u '+%Y-%m-%d %H:%M UTC') (${MIHOMO_VERSION})"
           BASIC_AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
           echo "::add-mask::${BASIC_AUTH}"
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${BASIC_AUTH}" \
-            push --force "https://github.com/${GITHUB_REPOSITORY}.git" release:release
+
+          attempt=1
+          until git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${BASIC_AUTH}" \
+            push --force "https://github.com/${GITHUB_REPOSITORY}.git" release:release; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "git push failed after 3 attempts"
+              exit 1
+            fi
+            echo "git push attempt ${attempt} failed, retrying in 5s..."
+            sleep 5
+            attempt=$((attempt + 1))
+          done
 
       - name: Sync independent GitHub Releases
         if: steps.diff.outputs.any_release_changed == 'true'
@@ -879,85 +978,143 @@ jobs:
           CHANGED_RELEASES: ${{ steps.diff.outputs.changed_releases }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import time
+          import urllib.error
+          import urllib.request
 
-          retry_cmd() {
-            local attempt=1
-            local max_attempts=3
-            until "$@"; do
-              if [ "$attempt" -ge "$max_attempts" ]; then
-                echo "Command failed after ${max_attempts} attempts: $*"
-                return 1
-              fi
-              echo "Attempt ${attempt} failed, retrying in 5s..."
-              sleep 5
-              attempt=$((attempt + 1))
-            done
-          }
+          gh_token = os.environ["GH_TOKEN"]
+          gh_repo = os.environ["GH_REPO"]
+          changed_tags = [t for t in os.environ.get("CHANGED_RELEASES", "").split() if t]
+          manifest = {s["tag"]: s for s in json.loads(pathlib.Path("build_manifest.json").read_text(encoding="utf-8"))}
 
-          DEFAULT_BRANCH=$(gh api "repos/${GH_REPO}" --jq '.default_branch')
+          def api_json(url: str) -> tuple[int, dict | None]:
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Authorization": f"Bearer {gh_token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "clash-rules-mrs-workflow",
+                  },
+              )
+              for attempt in range(1, 4):
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as resp:
+                          return resp.status, json.loads(resp.read().decode("utf-8"))
+                  except urllib.error.HTTPError as exc:
+                      if exc.code == 404:
+                          return 404, None
+                      if exc.code >= 500 or exc.code == 429:
+                          if attempt < 3:
+                              time.sleep(2 * attempt)
+                              continue
+                      raise RuntimeError(f"GitHub API HTTP {exc.code} for {url}: {exc.read().decode('utf-8', 'ignore')[:300]}")
+                  except urllib.error.URLError as exc:
+                      if attempt < 3:
+                          time.sleep(2 * attempt)
+                          continue
+                      raise RuntimeError(f"GitHub API network error for {url}: {exc}")
+              raise RuntimeError(f"Unreachable retry state for {url}")
 
-          for tag in $CHANGED_RELEASES; do
-            case "$tag" in
-              clash-rules)
-                TITLE="Loyalsoldier/clash-rules (MRS)"
-                LATEST_FLAG="--latest"
-                ;;
-              v2ray-rules-dat)
-                TITLE="Loyalsoldier/v2ray-rules-dat (MRS)"
-                LATEST_FLAG="--latest=false"
-                ;;
-              cn-blocked-domain)
-                TITLE="Loyalsoldier/cn-blocked-domain (MRS)"
-                LATEST_FLAG="--latest=false"
-                ;;
-              *)
-                echo "Unknown release tag: ${tag}"
-                exit 1
-                ;;
-            esac
+          def run_retry(cmd: list[str], max_attempts: int = 3) -> None:
+              for attempt in range(1, max_attempts + 1):
+                  res = subprocess.run(cmd)
+                  if res.returncode == 0:
+                      return
+                  if attempt == max_attempts:
+                      raise RuntimeError(f"Command failed after {max_attempts} attempts: {' '.join(cmd)}")
+                  print(f"Attempt {attempt} failed, retrying in 5s...")
+                  time.sleep(5)
 
-            ASSETS=( "out/${tag}"/*.mrs "out/${tag}/checksums.sha256" )
-            NOTES_FILE="notes/${tag}.md"
-            echo "=== Syncing Release [${tag}] (${#ASSETS[@]} files) ==="
+          repo_status, repo_info = api_json(f"https://api.github.com/repos/{gh_repo}")
+          if repo_status != 200 or not repo_info:
+              raise RuntimeError(f"Failed to query repo metadata for {gh_repo}")
+          default_branch = repo_info["default_branch"]
 
-            if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
-              retry_cmd gh release upload "$tag" "${ASSETS[@]}" --repo "$GH_REPO" --clobber
-              gh release view "$tag" --repo "$GH_REPO" --json assets -q '.assets[].name' | while IFS= read -r asset; do
-                [ -z "$asset" ] && continue
-                if [ ! -f "out/${tag}/${asset}" ]; then
-                  echo "Removing stale release asset from [${tag}]: ${asset}"
-                  retry_cmd gh release delete-asset "$tag" "${asset}" --repo "$GH_REPO" --yes
-                fi
-              done
-              retry_cmd gh release edit "$tag" --repo "$GH_REPO" \
-                --title "$TITLE" \
-                "$LATEST_FLAG" \
-                --notes-file "$NOTES_FILE"
-            else
-              retry_cmd gh release create "$tag" "${ASSETS[@]}" \
-                --repo "$GH_REPO" \
-                --target "$DEFAULT_BRANCH" \
-                --title "$TITLE" \
-                "$LATEST_FLAG" \
-                --notes-file "$NOTES_FILE"
-            fi
-          done
+          for tag in changed_tags:
+              src = manifest[tag]
+              sid = src["id"]
+              title = src["title"]
+              is_latest = bool(src["is_latest"])
+              src_dir = pathlib.Path("out") / sid
+              mrs_files = sorted(src_dir.glob("*.mrs"), key=lambda p: p.name)
+              sha_file = src_dir / "checksums.sha256"
+              notes_file = pathlib.Path("notes") / f"{tag}.md"
+
+              print(f"=== Syncing Release [{tag}] ({len(mrs_files)} MRS + checksums) ===")
+
+              # 1. Idempotently ensure Release exists (create empty first so upload retries never hit "already exists")
+              rel_status, rel_info = api_json(f"https://api.github.com/repos/{gh_repo}/releases/tags/{tag}")
+              created_now = False
+              if rel_status == 404:
+                  create_cmd = [
+                      "gh", "release", "create", tag,
+                      "--repo", gh_repo,
+                      "--target", default_branch,
+                      "--title", title,
+                      "--notes-file", str(notes_file),
+                      "--latest" if is_latest else "--latest=false",
+                  ]
+                  run_retry(create_cmd)
+                  created_now = True
+                  rel_status, rel_info = api_json(f"https://api.github.com/repos/{gh_repo}/releases/tags/{tag}")
+
+              # 2. Upload all .mrs assets first (without checksums.sha256 yet)
+              run_retry(
+                  ["gh", "release", "upload", tag, *[str(p) for p in mrs_files], "--repo", gh_repo, "--clobber"]
+              )
+
+              # 3. Clean up stale remote assets not in local output
+              expected_names = {p.name for p in mrs_files} | {"checksums.sha256"}
+              remote_assets = [a["name"] for a in (rel_info or {}).get("assets", [])]
+              for asset_name in remote_assets:
+                  if asset_name not in expected_names:
+                      print(f"Removing stale release asset from [{tag}]: {asset_name}")
+                      run_retry(["gh", "release", "delete-asset", tag, asset_name, "--repo", gh_repo, "--yes"])
+
+              # 4. Update title, release notes, and latest flag (only assert --latest on primary release)
+              if not created_now:
+                  edit_cmd = [
+                      "gh", "release", "edit", tag,
+                      "--repo", gh_repo,
+                      "--title", title,
+                      "--notes-file", str(notes_file),
+                  ]
+                  if is_latest:
+                      edit_cmd.append("--latest")
+                  run_retry(edit_cmd)
+
+              # 5. Upload checksums.sha256 LAST as an atomic commit marker for self-healing detection
+              run_retry(["gh", "release", "upload", tag, str(sha_file), "--repo", gh_repo, "--clobber"])
+          PY
 
       - name: Write workflow summary
         if: always()
         env:
+          JOB_STATUS: ${{ job.status }}
+          DIFF_OUTCOME: ${{ steps.diff.outcome }}
           BRANCH_CHANGED: ${{ steps.diff.outputs.branch_changed }}
           CHANGED_RELEASES: ${{ steps.diff.outputs.changed_releases }}
         run: |
           set -euo pipefail
           [ -f build_manifest.json ] || exit 0
-          BRANCH_STATUS="无变化（跳过）"
-          [ "$BRANCH_CHANGED" = "true" ] && BRANCH_STATUS="已更新"
-          RELEASE_STATUS="无变化（跳过）"
-          [ -n "$CHANGED_RELEASES" ] && RELEASE_STATUS="已更新 (${CHANGED_RELEASES})"
+          if [ "$DIFF_OUTCOME" != "success" ]; then
+            BRANCH_STATUS="未执行（前置步骤失败）"
+            RELEASE_STATUS="未执行（前置步骤失败）"
+          else
+            BRANCH_STATUS="无变化（跳过）"
+            [ "$BRANCH_CHANGED" = "true" ] && BRANCH_STATUS="已更新"
+            RELEASE_STATUS="无变化（跳过）"
+            [ -n "$CHANGED_RELEASES" ] && RELEASE_STATUS="已更新 (${CHANGED_RELEASES})"
+          fi
           {
             printf '%s\n' '## MRS 构建摘要'
+            printf -- '- **任务状态：** `%s`\n' "${JOB_STATUS:-unknown}"
             printf -- '- **Mihomo 版本：** `%s`\n' "${MIHOMO_VERSION:-unknown}"
             printf -- '- **孤儿分支 (`release`)：** %s\n' "$BRANCH_STATUS"
             printf -- '- **独立 Releases：** %s\n' "$RELEASE_STATUS"
