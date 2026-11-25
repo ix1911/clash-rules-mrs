@@ -121,13 +121,21 @@ jobs:
             printf -- '- **Mihomo Version:** `%s`\n' "$MIHOMO_VERSION"
             printf -- '- **Source:** `Loyalsoldier/clash-rules@release`\n'
             printf '\n'
+            printf '%s\n' '## 订阅线路说明'
+            printf '%s\n' '以下以 `direct.mrs` 为例，将末尾文件名替换为下方任意规则文件即可使用：'
+            printf '\n'
+            printf -- '- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/%s/releases/latest/download/direct.mrs\n' "$GH_REPO"
+            printf -- '- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/%s/release/direct.mrs\n' "$GH_REPO"
+            printf -- '- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/%s@release/direct.mrs\n' "$GH_REPO"
+            printf '\n'
             printf '%s\n' '## Assets'
-            printf '%s\n' '| File | Size |'
-            printf '%s\n' '| :--- | ---: |'
+            printf '%s\n' '| File | Size | Releases | Raw | jsDelivr |'
+            printf '%s\n' '| :--- | ---: | :---: | :---: | :---: |'
             for file in out/*.mrs; do
               name=$(basename "$file")
               size=$(du -h "$file" | cut -f1)
-              printf -- '| `%s` | %s |\n' "$name" "$size"
+              printf -- '| `%s` | %s | [直链](https://github.com/%s/releases/latest/download/%s) | [Raw](https://raw.githubusercontent.com/%s/release/%s) | [CDN](https://cdn.jsdelivr.net/gh/%s@release/%s) |\n' \
+                "$name" "$size" "$GH_REPO" "$name" "$GH_REPO" "$name" "$GH_REPO" "$name"
             done
           } > release_notes.md
 
