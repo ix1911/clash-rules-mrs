@@ -2,13 +2,17 @@ name: Convert Loyalsoldier Rules to MRS
 
 on:
   schedule:
-    - cron: "0 23 * * *" # UTC 23:00 ≈ 北京时间 07:00
+    - cron: "15 23 * * *" # UTC 23:15 ≈ 北京时间 07:15（错开上游 06:00 / 06:30 构建）
   workflow_dispatch:
     inputs:
       force_publish:
         description: "即使规则无变化也强制重新发布"
         type: boolean
         default: false
+      mihomo_version:
+        description: "指定 mihomo 版本标签（默认 latest，如 v1.19.10）"
+        type: string
+        default: "latest"
 
 permissions:
   contents: write
@@ -20,141 +24,743 @@ concurrency:
 jobs:
   convert:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Download mihomo
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQ_VERSION: ${{ inputs.mihomo_version || github.event.inputs.mihomo_version || 'latest' }}
         run: |
           set -euo pipefail
-          RELEASE_JSON=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
-          MIHOMO_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          if [ "$REQ_VERSION" = "latest" ] || [ -z "$REQ_VERSION" ]; then
+            API_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+          else
+            API_URL="https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${REQ_VERSION}"
+          fi
+
+          RELEASE_JSON=$(curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+            --connect-timeout 15 --max-time 60 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL")
+
+          MIHOMO_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name // empty')
           URL=$(echo "$RELEASE_JSON" | jq -r '
             (.assets[] | select(.name | test("^mihomo-linux-amd64-compatible-v.*\\.gz$")) | .browser_download_url),
             (.assets[] | select(.name | test("^mihomo-linux-amd64-v.*\\.gz$")) | .browser_download_url)
           ' | head -n 1)
 
-          [ -n "$URL" ] && [ "$URL" != "null" ] || { echo "Failed to resolve mihomo URL"; exit 1; }
+          [ -n "$MIHOMO_VERSION" ] || { echo "Failed to resolve mihomo version"; exit 1; }
+          [ -n "$URL" ] && [ "$URL" != "null" ] || { echo "Failed to resolve mihomo download URL"; exit 1; }
+
           echo "MIHOMO_VERSION=$MIHOMO_VERSION" >> "$GITHUB_ENV"
           echo "Downloading mihomo ${MIHOMO_VERSION}..."
-          curl -fsSL --retry 3 --retry-delay 2 "$URL" -o mihomo.gz
+          curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+            --connect-timeout 15 --max-time 120 \
+            "$URL" -o mihomo.gz
           gunzip -f mihomo.gz
           chmod +x mihomo
           ./mihomo -v
 
-      - name: Download, Convert & Verify
+      - name: Download, Preprocess, Convert & Verify
         run: |
           set -euo pipefail
-          mkdir -p raw out
-          BASE="https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release"
-          DOMAIN_RULES=(direct proxy reject private apple icloud google gfw tld-not-cn)
-          IP_RULES=(telegramcidr lancidr cncidr)
+          python3 - <<'PY'
+          import concurrent.futures
+          import hashlib
+          import ipaddress
+          import json
+          import pathlib
+          import re
+          import subprocess
+          import sys
 
-          for f in "${DOMAIN_RULES[@]}"; do
-            curl -fsSL --retry 3 --retry-delay 2 -o "raw/${f}.txt" "${BASE}/${f}.txt"
-            [ -s "raw/${f}.txt" ] || { echo "Empty source: ${f}.txt"; exit 1; }
-            ./mihomo convert-ruleset domain yaml "raw/${f}.txt" "out/${f}.mrs"
-            [ -s "out/${f}.mrs" ] || { echo "Empty output: ${f}.mrs"; exit 1; }
-          done
+          RAW_DIR = pathlib.Path("raw")
+          CLEAN_DIR = pathlib.Path("clean")
+          OUT_DIR = pathlib.Path("out")
+          for d in (RAW_DIR, CLEAN_DIR, OUT_DIR):
+              d.mkdir(parents=True, exist_ok=True)
 
-          for f in "${IP_RULES[@]}"; do
-            curl -fsSL --retry 3 --retry-delay 2 -o "raw/${f}.txt" "${BASE}/${f}.txt"
-            [ -s "raw/${f}.txt" ] || { echo "Empty source: ${f}.txt"; exit 1; }
-            ./mihomo convert-ruleset ipcidr yaml "raw/${f}.txt" "out/${f}.mrs"
-            [ -s "out/${f}.mrs" ] || { echo "Empty output: ${f}.mrs"; exit 1; }
-          done
+          SOURCES = [
+              {
+                  "id": "cn-blocked-domain",
+                  "name": "Loyalsoldier/cn-blocked-domain",
+                  "repo_url": "https://github.com/Loyalsoldier/cn-blocked-domain",
+                  "description": (
+                      "通过 GreatFire Analyzer 的 JSON API"
+                      "（https://en.greatfire.org/api/tags?status=blocked）"
+                      "获取在中国大陆被屏蔽的域名和 IP 地址，并进行校验、去重与聚合。"
+                  ),
+                  "rules": [
+                      {
+                          "out": "cn-blocked-domains",
+                          "src_name": "domains.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/domains.txt",
+                          "behavior": "domain",
+                          "mode": "plain_domain",
+                          "desc": "中国大陆被屏蔽域名列表",
+                      },
+                      {
+                          "out": "cn-blocked-ip",
+                          "src_name": "ip.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/ip.txt",
+                          "behavior": "ipcidr",
+                          "mode": "plain_ip",
+                          "desc": "中国大陆被屏蔽 IP 地址列表",
+                      },
+                      {
+                          "out": "cn-blocked-deduplicated-domains",
+                          "src_name": "deduplicated-domains.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/cn-blocked-domain/release/deduplicated-domains.txt",
+                          "behavior": "domain",
+                          "mode": "plain_domain",
+                          "desc": "因父域名已存在而被移除的子域名",
+                          "allow_empty": True,
+                      },
+                  ],
+                  "extras": [],
+              },
+              {
+                  "id": "clash-rules",
+                  "name": "Loyalsoldier/clash-rules",
+                  "repo_url": "https://github.com/Loyalsoldier/clash-rules",
+                  "description": (
+                      "适用于 Clash Premium / Mihomo 内核及各 GUI 客户端（ClashX Pro、clash-party、"
+                      "clash-verge-rev、Clash for Windows、clashmi、Clash Meta for Android、OpenClash 等）"
+                      "的规则集（RULE-SET），上游每天北京时间 06:30 自动构建。"
+                  ),
+                  "rules": [
+                      {
+                          "out": "direct",
+                          "src_name": "direct.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "直连域名列表",
+                      },
+                      {
+                          "out": "proxy",
+                          "src_name": "proxy.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/proxy.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "代理域名列表",
+                      },
+                      {
+                          "out": "reject",
+                          "src_name": "reject.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/reject.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "广告域名列表",
+                      },
+                      {
+                          "out": "private",
+                          "src_name": "private.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/private.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "私有网络专用域名列表",
+                      },
+                      {
+                          "out": "apple",
+                          "src_name": "apple.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/apple.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "Apple 在中国大陆可直连的域名列表",
+                      },
+                      {
+                          "out": "icloud",
+                          "src_name": "icloud.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/icloud.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "iCloud 域名列表",
+                      },
+                      {
+                          "out": "google",
+                          "src_name": "google.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/google.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "[慎用] Google 在中国大陆可直连的域名列表",
+                      },
+                      {
+                          "out": "gfw",
+                          "src_name": "gfw.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/gfw.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "GFWList 域名列表",
+                      },
+                      {
+                          "out": "tld-not-cn",
+                          "src_name": "tld-not-cn.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/tld-not-cn.txt",
+                          "behavior": "domain",
+                          "mode": "clash_yaml",
+                          "desc": "非中国大陆使用的顶级域名列表",
+                      },
+                      {
+                          "out": "telegramcidr",
+                          "src_name": "telegramcidr.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/telegramcidr.txt",
+                          "behavior": "ipcidr",
+                          "mode": "clash_yaml",
+                          "desc": "Telegram 使用的 IP 地址列表",
+                      },
+                      {
+                          "out": "lancidr",
+                          "src_name": "lancidr.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/lancidr.txt",
+                          "behavior": "ipcidr",
+                          "mode": "clash_yaml",
+                          "desc": "局域网 IP 及保留 IP 地址列表",
+                      },
+                      {
+                          "out": "cncidr",
+                          "src_name": "cncidr.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/cncidr.txt",
+                          "behavior": "ipcidr",
+                          "mode": "clash_yaml",
+                          "desc": "中国大陆 IP 地址列表",
+                      },
+                  ],
+                  "extras": [
+                      {
+                          "name": "applications.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/applications.txt",
+                          "note": "需要直连的常见软件列表（`classical` 进程规则，MRS 格式不支持，请直接引用上游原文件并设置 `behavior: classical`）",
+                      }
+                  ],
+              },
+              {
+                  "id": "v2ray-rules-dat",
+                  "name": "Loyalsoldier/v2ray-rules-dat",
+                  "repo_url": "https://github.com/Loyalsoldier/v2ray-rules-dat",
+                  "description": (
+                      "V2Ray 路由规则文件加强版，适用于 V2Ray、Xray-core、mihomo、hysteria、"
+                      "Trojan-Go、leaf 及各 GUI 版代理软件，上游每天北京时间 06:00 自动构建。"
+                      "转换为 MRS 时已自动将裸域名与 `domain:` 规范为 `+.` 后缀匹配、`full:` 转为精确匹配、"
+                      "自动完成 IDN Punycode 转码，并过滤 MRS 不支持的 `regexp:` / `keyword:` / `include:` 条目。"
+                  ),
+                  "rules": [
+                      {
+                          "out": "direct-list",
+                          "src_name": "direct-list.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/direct-list.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "直连域名列表",
+                      },
+                      {
+                          "out": "proxy-list",
+                          "src_name": "proxy-list.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/proxy-list.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "代理域名列表",
+                      },
+                      {
+                          "out": "reject-list",
+                          "src_name": "reject-list.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "广告域名列表",
+                      },
+                      {
+                          "out": "china-list",
+                          "src_name": "china-list.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/china-list.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "@felixonmars/dnsmasq-china-list 中国大陆可直连域名列表",
+                      },
+                      {
+                          "out": "apple-cn",
+                          "src_name": "apple-cn.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/apple-cn.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "Apple 在中国大陆可直连的域名列表",
+                      },
+                      {
+                          "out": "google-cn",
+                          "src_name": "google-cn.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/google-cn.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "Google 在中国大陆可直连的域名列表",
+                      },
+                      {
+                          "out": "v2ray-gfw",
+                          "src_name": "gfw.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "GFWList 域名列表（防重名输出为 v2ray-gfw.mrs）",
+                      },
+                      {
+                          "out": "win-spy",
+                          "src_name": "win-spy.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/win-spy.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "Windows 操作系统使用的隐私跟踪域名列表",
+                      },
+                      {
+                          "out": "win-update",
+                          "src_name": "win-update.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/win-update.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "Windows 操作系统使用的系统升级域名列表",
+                      },
+                      {
+                          "out": "win-extra",
+                          "src_name": "win-extra.txt",
+                          "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/win-extra.txt",
+                          "behavior": "domain",
+                          "mode": "v2ray_domain",
+                          "desc": "Windows 操作系统使用的附加隐私跟踪域名列表",
+                      },
+                  ],
+                  "extras": [
+                      {
+                          "name": "geoip.dat",
+                          "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+                          "note": "GeoIP 数据库原文件（二进制 `.dat`，直接引用上游地址即可）",
+                      },
+                      {
+                          "name": "geosite.dat",
+                          "url": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
+                          "note": "GeoSite 数据库原文件（二进制 `.dat`，直接引用上游地址即可）",
+                      },
+                  ],
+              },
+          ]
 
-          (cd out && sha256sum *.mrs | LC_ALL=C sort -k2 > checksums.sha256)
+          LABEL_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
+          CLASH_ITEM_RE = re.compile(r"^\s*-\s+\S+")
 
-      - name: Detect changes
+          def normalize_domain(domain: str) -> str | None:
+              domain = domain.strip().strip(".").lower()
+              if not domain:
+                  return None
+              try:
+                  ascii_domain = domain.encode("idna").decode("ascii").lower()
+              except UnicodeError:
+                  return None
+              if not ascii_domain or len(ascii_domain) > 253:
+                  return None
+              try:
+                  ipaddress.ip_address(ascii_domain)
+                  return None
+              except ValueError:
+                  pass
+              labels = ascii_domain.split(".")
+              if any(not LABEL_RE.fullmatch(lbl) for lbl in labels):
+                  return None
+              return ascii_domain
+
+          def download(url: str, dest: pathlib.Path) -> None:
+              subprocess.run(
+                  [
+                      "curl", "-fsSL",
+                      "--retry", "3",
+                      "--retry-delay", "2",
+                      "--retry-all-errors",
+                      "--connect-timeout", "15",
+                      "--max-time", "60",
+                      "-o", str(dest),
+                      url,
+                  ],
+                  check=True,
+              )
+
+          def validate_clash_yaml(src: pathlib.Path) -> int:
+              text = src.read_text(encoding="utf-8-sig", errors="strict")
+              has_payload = False
+              count = 0
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if stripped == "payload:" or stripped.startswith("payload: "):
+                      has_payload = True
+                  elif CLASH_ITEM_RE.match(line):
+                      count += 1
+              if not has_payload or count == 0:
+                  sys.exit(f"Invalid or empty Clash YAML ruleset: {src}")
+              return count
+
+          def preprocess_plain_domain(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int]:
+              seen, skipped = set(), 0
+              for raw_line in src.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+                  line = raw_line.split("#", 1)[0].strip().strip("'\"").lower()
+                  if not line:
+                      continue
+                  if line.startswith("+."):
+                      prefix, raw_dom = "+.", line[2:]
+                  elif line.startswith("."):
+                      prefix, raw_dom = ".", line[1:]
+                  else:
+                      prefix, raw_dom = "+.", line
+                  norm = normalize_domain(raw_dom)
+                  if not norm:
+                      skipped += 1
+                      continue
+                  seen.add(f"{prefix}{norm}")
+              items = sorted(seen)
+              dst.write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
+              return len(items), skipped
+
+          def preprocess_v2ray_domain(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int]:
+              seen, skipped = set(), 0
+              for raw_line in src.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+                  line = raw_line.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  line = re.sub(r"\s+@\S+", "", line).strip().lower()
+                  if not line:
+                      continue
+                  if line.startswith(("regexp:", "keyword:", "include:")):
+                      skipped += 1
+                      continue
+                  if line.startswith("full:"):
+                      prefix, raw_dom = "", line[5:]
+                  elif line.startswith("domain:"):
+                      prefix, raw_dom = "+.", line[7:].lstrip("+.")
+                  else:
+                      prefix, raw_dom = "+.", line.lstrip("+.")
+                  norm = normalize_domain(raw_dom)
+                  if not norm:
+                      skipped += 1
+                      continue
+                  seen.add(f"{prefix}{norm}")
+              items = sorted(seen)
+              dst.write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
+              return len(items), skipped
+
+          def preprocess_plain_ip(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int]:
+              v4_nets, v6_nets, skipped = [], [], 0
+              for raw_line in src.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+                  line = raw_line.split("#", 1)[0].strip().strip("'\"")
+                  if not line:
+                      continue
+                  try:
+                      net = ipaddress.ip_network(line, strict=False)
+                  except ValueError:
+                      skipped += 1
+                      continue
+                  if isinstance(net, ipaddress.IPv4Network):
+                      v4_nets.append(net)
+                  else:
+                      v6_nets.append(net)
+              collapsed = [str(n) for n in ipaddress.collapse_addresses(v4_nets)] + [
+                  str(n) for n in ipaddress.collapse_addresses(v6_nets)
+              ]
+              dst.write_text("\n".join(collapsed) + ("\n" if collapsed else ""), encoding="utf-8")
+              return len(collapsed), skipped
+
+          def human_size(num_bytes: int) -> str:
+              size = float(num_bytes)
+              for unit in ("B", "KB", "MB", "GB"):
+                  if size < 1024 or unit == "GB":
+                      return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+                  size /= 1024
+              return f"{num_bytes} B"
+
+          # 1. Parallel download for speed while preserving deterministic build order
+          download_tasks = [
+              (rule["url"], RAW_DIR / f"{rule['out']}.txt", source["id"], rule["src_name"])
+              for source in SOURCES
+              for rule in source["rules"]
+          ]
+          print(f"Downloading {len(download_tasks)} upstream rule files in parallel...")
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+              futures = {
+                  pool.submit(download, url, dest): (sid, sname, url)
+                  for url, dest, sid, sname in download_tasks
+              }
+              for fut in concurrent.futures.as_completed(futures):
+                  sid, sname, url = futures[fut]
+                  try:
+                      fut.result()
+                      print(f"  Downloaded [{sid}] {sname}")
+                  except Exception as exc:
+                      sys.exit(f"Failed downloading [{sid}] {sname} ({url}): {exc}")
+
+          # 2. Deterministic preprocess, convert & verify
+          manifest = []
+          for source in SOURCES:
+              src_entry = {
+                  "id": source["id"],
+                  "name": source["name"],
+                  "repo_url": source["repo_url"],
+                  "description": source["description"],
+                  "rules": [],
+                  "extras": source["extras"],
+              }
+              for rule in source["rules"]:
+                  out_stem = rule["out"]
+                  mrs_name = f"{out_stem}.mrs"
+                  raw_path = RAW_DIR / f"{out_stem}.txt"
+                  out_path = OUT_DIR / mrs_name
+                  allow_empty = rule.get("allow_empty", False)
+
+                  mode = rule["mode"]
+                  skipped = 0
+                  if mode == "clash_yaml":
+                      count = validate_clash_yaml(raw_path)
+                      src_for_mihomo = raw_path
+                      mihomo_fmt = "yaml"
+                  else:
+                      clean_path = CLEAN_DIR / f"{out_stem}.txt"
+                      if mode == "plain_domain":
+                          count, skipped = preprocess_plain_domain(raw_path, clean_path)
+                      elif mode == "v2ray_domain":
+                          count, skipped = preprocess_v2ray_domain(raw_path, clean_path)
+                      elif mode == "plain_ip":
+                          count, skipped = preprocess_plain_ip(raw_path, clean_path)
+                      else:
+                          sys.exit(f"Unknown mode: {mode}")
+
+                      if count == 0:
+                          if allow_empty:
+                              print(f"  WARN: [{source['id']}] {rule['src_name']} has 0 valid entries, skipping MRS.")
+                              src_entry["rules"].append({
+                                  **rule,
+                                  "mrs": mrs_name,
+                                  "status": "empty",
+                                  "size": "-",
+                                  "count": 0,
+                                  "skipped": skipped,
+                              })
+                              continue
+                          sys.exit(f"Zero valid entries after preprocessing: {rule['url']}")
+                      src_for_mihomo = clean_path
+                      mihomo_fmt = "text"
+
+                  subprocess.run(
+                      ["./mihomo", "convert-ruleset", rule["behavior"], mihomo_fmt, str(src_for_mihomo), str(out_path)],
+                      check=True,
+                  )
+                  if not out_path.exists() or out_path.stat().st_size == 0:
+                      sys.exit(f"Empty MRS output: {out_path}")
+
+                  size_str = human_size(out_path.stat().st_size)
+                  print(f"  OK: {mrs_name} ({count} rules, {size_str}, skipped={skipped})")
+                  src_entry["rules"].append({
+                      **rule,
+                      "mrs": mrs_name,
+                      "status": "ok",
+                      "size": size_str,
+                      "count": count,
+                      "skipped": skipped,
+                  })
+              manifest.append(src_entry)
+
+          checksum_lines = []
+          for mrs_file in sorted(OUT_DIR.glob("*.mrs"), key=lambda p: p.name):
+              digest = hashlib.sha256(mrs_file.read_bytes()).hexdigest()
+              checksum_lines.append(f"{digest}  {mrs_file.name}")
+          (OUT_DIR / "checksums.sha256").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+          pathlib.Path("build_manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(f"Total MRS files built: {len(checksum_lines)}")
+          PY
+
+      - name: Detect changes (branch & release independently)
         id: diff
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           FORCE_PUBLISH: ${{ inputs.force_publish || github.event.inputs.force_publish || 'false' }}
         run: |
           set -euo pipefail
           if [ "$FORCE_PUBLISH" = "true" ]; then
-            echo "Force publish enabled."
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Force publish enabled for both branch and release."
+            echo "branch_changed=true" >> "$GITHUB_OUTPUT"
+            echo "release_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          if git clone --depth 1 --branch release \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" prev 2>/dev/null; then
-            if [ -f prev/checksums.sha256 ] && cmp -s prev/checksums.sha256 out/checksums.sha256; then
-              echo "No rule changes detected, skipping publish."
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              exit 0
+          # 1. Check orphan release branch via lightweight Contents API (no full binary clone)
+          branch_changed=true
+          if gh api -H "Accept: application/vnd.github.raw+json" \
+            "repos/${GH_REPO}/contents/checksums.sha256?ref=release" > prev_branch.sha256 2>/dev/null; then
+            if cmp -s prev_branch.sha256 out/checksums.sha256; then
+              branch_changed=false
             fi
           fi
 
-          echo "Rule changes detected (or first run)."
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          # 2. Check GitHub Releases (latest) independently to auto-heal split-brain states
+          release_changed=true
+          if gh release download latest --repo "$GH_REPO" --pattern "checksums.sha256" --output prev_release.sha256 2>/dev/null; then
+            if cmp -s prev_release.sha256 out/checksums.sha256; then
+              (cd out && ls -1 *.mrs checksums.sha256 | LC_ALL=C sort) > expected_assets.txt
+              gh release view latest --repo "$GH_REPO" --json assets -q '.assets[].name' | LC_ALL=C sort > remote_assets.txt
+              if cmp -s expected_assets.txt remote_assets.txt; then
+                release_changed=false
+              fi
+            fi
+          fi
+
+          echo "branch_changed=${branch_changed}"
+          echo "release_changed=${release_changed}"
+          echo "branch_changed=${branch_changed}" >> "$GITHUB_OUTPUT"
+          echo "release_changed=${release_changed}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        if: steps.diff.outputs.branch_changed == 'true' || steps.diff.outputs.release_changed == 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+
+          gh_repo = os.environ["GH_REPO"]
+          mihomo_version = os.environ["MIHOMO_VERSION"]
+          now_utc = datetime.datetime.now(datetime.timezone.utc)
+          now_cst = now_utc + datetime.timedelta(hours=8)
+          manifest = json.loads(pathlib.Path("build_manifest.json").read_text(encoding="utf-8"))
+          total_mrs = sum(1 for s in manifest for r in s["rules"] if r["status"] == "ok")
+
+          lines = [
+              "## Build Info",
+              f"- **Updated:** {now_cst:%Y-%m-%d %H:%M} (UTC+8) / {now_utc:%Y-%m-%d %H:%M} UTC",
+              f"- **Mihomo Version:** `{mihomo_version}`",
+              f"- **Total MRS Rules:** {total_mrs}",
+              "",
+              "## 订阅线路说明",
+              "以下以 `direct.mrs` 为例，将末尾文件名替换为下方任意 `.mrs` 文件名即可使用：",
+              "",
+              f"- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/{gh_repo}/releases/latest/download/direct.mrs",
+              f"- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/{gh_repo}/release/direct.mrs",
+              f"- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/{gh_repo}@release/direct.mrs",
+              "",
+              "## 规则来源与文件清单",
+              "",
+          ]
+
+          for idx, src in enumerate(manifest, 1):
+              lines.append(f"### {idx}. {src['name']}")
+              lines.append(f"- **来源：** {src['repo_url']}")
+              lines.append(f"- **说明：** {src['description']}")
+              lines.append("")
+              lines.append("| MRS 文件 | 类型 | 条目数 | 大小 | 说明与原始文件 | 订阅地址 |")
+              lines.append("| :--- | :---: | ---: | ---: | :--- | :---: |")
+              for r in src["rules"]:
+                  mrs = r["mrs"]
+                  desc_cell = f"{r['desc']}（[{r['src_name']}]({r['url']})）"
+                  if r.get("skipped"):
+                      desc_cell += f" · 已过滤 {r['skipped']} 条非 MRS 规则"
+                  count_cell = f"{r['count']:,}" if isinstance(r.get("count"), int) else "-"
+                  if r["status"] == "ok":
+                      rel_url = f"https://github.com/{gh_repo}/releases/latest/download/{mrs}"
+                      raw_url = f"https://raw.githubusercontent.com/{gh_repo}/release/{mrs}"
+                      cdn_url = f"https://cdn.jsdelivr.net/gh/{gh_repo}@release/{mrs}"
+                      links = f"[Releases]({rel_url}) · [Raw]({raw_url}) · [CDN]({cdn_url})"
+                      lines.append(f"| `{mrs}` | `{r['behavior']}` | {count_cell} | {r['size']} | {desc_cell} | {links} |")
+                  else:
+                      lines.append(f"| `{mrs}` | `{r['behavior']}` | 0 | - | {desc_cell} | 当日无有效条目 |")
+
+              if src["extras"]:
+                  lines.append("")
+                  lines.append("**其他原文件（非 MRS，请直接引用上游地址）：**")
+                  for ex in src["extras"]:
+                      lines.append(f"- **{ex['name']}**：{ex['url']}  \n  {ex['note']}")
+              lines.append("")
+
+          pathlib.Path("release_notes.md").write_text("\n".join(lines), encoding="utf-8")
+          PY
 
       - name: Publish to orphan release branch
-        if: steps.diff.outputs.changed == 'true'
+        if: steps.diff.outputs.branch_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p publish_branch
           cp -a out/. publish_branch/
+          cp -f release_notes.md publish_branch/README.md
           cd publish_branch
           git init -b release
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "chore: update MRS rules $(date -u '+%Y-%m-%d %H:%M UTC') (${MIHOMO_VERSION})"
-          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" release:release
+          BASIC_AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::${BASIC_AUTH}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${BASIC_AUTH}" \
+            push --force "https://github.com/${GITHUB_REPOSITORY}.git" release:release
 
       - name: Sync to GitHub Releases (latest)
-        if: steps.diff.outputs.changed == 'true'
+        if: steps.diff.outputs.release_changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M UTC')
-          {
-            printf '%s\n' '## Build Info'
-            printf -- '- **Updated:** %s\n' "$BUILD_TIME"
-            printf -- '- **Mihomo Version:** `%s`\n' "$MIHOMO_VERSION"
-            printf -- '- **Source:** `Loyalsoldier/clash-rules@release`\n'
-            printf '\n'
-            printf '%s\n' '## 订阅线路说明'
-            printf '%s\n' '以下以 `direct.mrs` 为例，将末尾文件名替换为下方任意规则文件即可使用：'
-            printf '\n'
-            printf -- '- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/%s/releases/latest/download/direct.mrs\n' "$GH_REPO"
-            printf -- '- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/%s/release/direct.mrs\n' "$GH_REPO"
-            printf -- '- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/%s@release/direct.mrs\n' "$GH_REPO"
-            printf '\n'
-            printf '%s\n' '## Assets'
-            printf '%s\n' '| File | Size | Releases | Raw | jsDelivr |'
-            printf '%s\n' '| :--- | ---: | :---: | :---: | :---: |'
-            for file in out/*.mrs; do
-              name=$(basename "$file")
-              size=$(du -h "$file" | cut -f1)
-              printf -- '| `%s` | %s | [直链](https://github.com/%s/releases/latest/download/%s) | [Raw](https://raw.githubusercontent.com/%s/release/%s) | [CDN](https://cdn.jsdelivr.net/gh/%s@release/%s) |\n' \
-                "$name" "$size" "$GH_REPO" "$name" "$GH_REPO" "$name" "$GH_REPO" "$name"
+          retry_cmd() {
+            local attempt=1
+            local max_attempts=3
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt} failed, retrying in 5s..."
+              sleep 5
+              attempt=$((attempt + 1))
             done
-          } > release_notes.md
+          }
 
           if gh release view latest --repo "$GH_REPO" >/dev/null 2>&1; then
-            gh release upload latest out/*.mrs out/checksums.sha256 --repo "$GH_REPO" --clobber
+            retry_cmd gh release upload latest out/*.mrs out/checksums.sha256 --repo "$GH_REPO" --clobber
             gh release view latest --repo "$GH_REPO" --json assets -q '.assets[].name' | while IFS= read -r asset; do
               [ -z "$asset" ] && continue
               if [ ! -f "out/${asset}" ]; then
                 echo "Removing stale release asset: ${asset}"
-                gh release delete-asset latest "${asset}" --repo "$GH_REPO" --yes
+                retry_cmd gh release delete-asset latest "${asset}" --repo "$GH_REPO" --yes
               fi
             done
-            gh release edit latest --repo "$GH_REPO" --latest --notes-file release_notes.md
+            retry_cmd gh release edit latest --repo "$GH_REPO" --latest --notes-file release_notes.md
           else
             DEFAULT_BRANCH=$(gh api "repos/${GH_REPO}" --jq '.default_branch')
-            gh release create latest out/*.mrs out/checksums.sha256 \
+            retry_cmd gh release create latest out/*.mrs out/checksums.sha256 \
               --repo "$GH_REPO" \
               --target "$DEFAULT_BRANCH" \
               --title "Latest MRS Rules" \
               --latest \
               --notes-file release_notes.md
           fi
+
+      - name: Write workflow summary
+        if: always()
+        env:
+          BRANCH_CHANGED: ${{ steps.diff.outputs.branch_changed }}
+          RELEASE_CHANGED: ${{ steps.diff.outputs.release_changed }}
+        run: |
+          set -euo pipefail
+          [ -f build_manifest.json ] || exit 0
+          BRANCH_STATUS="无变化（跳过）"
+          [ "$BRANCH_CHANGED" = "true" ] && BRANCH_STATUS="已更新"
+          RELEASE_STATUS="无变化（跳过）"
+          [ "$RELEASE_CHANGED" = "true" ] && RELEASE_STATUS="已更新"
+          {
+            printf '%s\n' '## MRS 构建摘要'
+            printf -- '- **Mihomo 版本：** `%s`\n' "${MIHOMO_VERSION:-unknown}"
+            printf -- '- **孤儿分支 (`release`)：** %s\n' "$BRANCH_STATUS"
+            printf -- '- **GitHub Releases (`latest`)：** %s\n' "$RELEASE_STATUS"
+            printf '\n'
+            if [ -f release_notes.md ]; then
+              cat release_notes.md
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
