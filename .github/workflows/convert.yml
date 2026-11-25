@@ -828,6 +828,22 @@ jobs:
           notes_dir = pathlib.Path("notes")
           notes_dir.mkdir(parents=True, exist_ok=True)
 
+          def pick_sample_mrs(src: dict) -> str:
+              ok_names = [r["mrs"] for r in src["rules"] if r["status"] == "ok"]
+              if src["sample_mrs"] in ok_names:
+                  return src["sample_mrs"]
+              return ok_names[0] if ok_names else src["sample_mrs"]
+
+          def render_route_examples(src: dict) -> list[str]:
+              tag = src["tag"]
+              sid = src["id"]
+              sample = pick_sample_mrs(src)
+              return [
+                  f"- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/{gh_repo}/releases/download/{tag}/{sample}",
+                  f"- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/{gh_repo}/release/{sid}/{sample}",
+                  f"- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/{gh_repo}@release/{sid}/{sample}",
+              ]
+
           def render_rule_table(src: dict) -> list[str]:
               tag = src["tag"]
               sid = src["id"]
@@ -859,11 +875,10 @@ jobs:
                   out.append(f"- **{ex['name']}**：{ex['url']}  \n  {ex['note']}")
               return out
 
-          # 1. Per-source Release Notes
+          # 1. Per-source Release Notes (each source uses its own tag, directory & sample .mrs)
           for src in manifest:
               tag = src["tag"]
-              sid = src["id"]
-              sample = src["sample_mrs"]
+              sample = pick_sample_mrs(src)
               ok_count = sum(1 for r in src["rules"] if r["status"] == "ok")
               other_links = " · ".join(
                   f"[`{other['tag']}`](https://github.com/{gh_repo}/releases/tag/{other['tag']})"
@@ -882,12 +897,10 @@ jobs:
                   f"- **上游仓库：** {src['repo_url']}",
                   f"- **简介：** {src['description']}",
                   "",
-                  "## 订阅线路说明",
-                  f"以下以 `{sample}` 为例，将末尾文件名替换为下方任意 `.mrs` 文件名即可使用：",
+                  f"## 订阅线路说明（{src['title']}）",
+                  f"以下以本来源的 `{sample}` 为例，将末尾文件名替换为下方任意 `.mrs` 文件名即可使用：",
                   "",
-                  f"- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/{gh_repo}/releases/download/{tag}/{sample}",
-                  f"- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/{gh_repo}/release/{sid}/{sample}",
-                  f"- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/{gh_repo}@release/{sid}/{sample}",
+                  *render_route_examples(src),
                   "",
                   "## 规则文件清单",
                   "",
@@ -897,7 +910,7 @@ jobs:
               lines.append("")
               (notes_dir / f"{tag}.md").write_text("\n".join(lines), encoding="utf-8")
 
-          # 2. Master README for the orphan release branch & workflow summary
+          # 2. Master README for the orphan release branch & workflow summary (per-source examples)
           total_mrs = sum(1 for s in manifest for r in s["rules"] if r["status"] == "ok")
           master = [
               "# Loyalsoldier Rules (MRS)",
@@ -907,28 +920,33 @@ jobs:
               f"- **Mihomo Version:** `{mihomo_version}`",
               f"- **Total MRS Rules:** {total_mrs}",
               "",
-              "## 订阅线路说明（按来源分目录 / 独立 Release）",
-              "以下以 `clash-rules` 来源的 `direct.mrs` 为例，切换来源时同步替换目录名 / Release 标签（`clash-rules`、`v2ray-rules-dat`、`cn-blocked-domain`）：",
-              "",
-              f"- **GitHub Releases 直链（走代理首选，实时更新）：** https://github.com/{gh_repo}/releases/download/clash-rules/direct.mrs",
-              f"- **GitHub Raw 直链（与孤儿分支强一致，实时更新）：** https://raw.githubusercontent.com/{gh_repo}/release/clash-rules/direct.mrs",
-              f"- **jsDelivr CDN 线路（直连友好，存在约 12 小时缓存）：** https://cdn.jsdelivr.net/gh/{gh_repo}@release/clash-rules/direct.mrs",
-              "",
               "## 独立发布页导航",
           ]
           for src in manifest:
               ok_count = sum(1 for r in src["rules"] if r["status"] == "ok")
               master.append(
-                  f"- **{src['name']}**（{ok_count} 个 MRS）："
+                  f"- **{src['title']}**（{ok_count} 个 MRS）："
                   f"[Release `{src['tag']}`](https://github.com/{gh_repo}/releases/tag/{src['tag']}) · "
                   f"分支目录 `{src['id']}/`"
               )
-          master.append("")
+
+          master.extend([
+              "",
+              "## 订阅线路说明（按来源分目录 / 独立 Release）",
+              "以下按三个来源分别举例，将示例链接末尾的文件名替换为对应来源清单中的任意 `.mrs` 文件名即可使用：",
+              "",
+          ])
+          for src in manifest:
+              sample = pick_sample_mrs(src)
+              master.append(f"### {src['title']}（以 `{sample}` 为例）")
+              master.extend(render_route_examples(src))
+              master.append("")
+
           master.append("## 规则来源与文件清单")
           master.append("")
 
           for idx, src in enumerate(manifest, 1):
-              master.append(f"### {idx}. {src['name']}")
+              master.append(f"### {idx}. {src['title']}")
               master.append(f"- **来源：** {src['repo_url']}")
               master.append(f"- **独立发布页：** https://github.com/{gh_repo}/releases/tag/{src['tag']}")
               master.append(f"- **说明：** {src['description']}")
