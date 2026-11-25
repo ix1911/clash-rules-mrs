@@ -107,6 +107,7 @@ jobs:
                           "behavior": "ipcidr",
                           "mode": "plain_ip",
                           "desc": "中国大陆被屏蔽 IP 地址列表",
+                          "allow_empty": True,
                       },
                       {
                           "out": "cn-blocked-deduplicated-domains",
@@ -344,6 +345,7 @@ jobs:
 
           LABEL_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
           CLASH_ITEM_RE = re.compile(r"^\s*-\s+\S+")
+          BRACKET_IP_RE = re.compile(r"^\[([^\]]+)\](?::\d+)?$")
 
           def normalize_domain(domain: str) -> str | None:
               domain = domain.strip().strip(".").lower()
@@ -394,8 +396,8 @@ jobs:
                   sys.exit(f"Invalid or empty Clash YAML ruleset: {src}")
               return count
 
-          def preprocess_plain_domain(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int]:
-              seen, skipped = set(), 0
+          def preprocess_plain_domain(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int, list[str]]:
+              seen, skipped, samples = set(), 0, []
               for raw_line in src.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
                   line = raw_line.split("#", 1)[0].strip().strip("'\"").lower()
                   if not line:
@@ -409,14 +411,16 @@ jobs:
                   norm = normalize_domain(raw_dom)
                   if not norm:
                       skipped += 1
+                      if len(samples) < 5:
+                          samples.append(raw_line.strip())
                       continue
                   seen.add(f"{prefix}{norm}")
               items = sorted(seen)
               dst.write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
-              return len(items), skipped
+              return len(items), skipped, samples
 
-          def preprocess_v2ray_domain(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int]:
-              seen, skipped = set(), 0
+          def preprocess_v2ray_domain(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int, list[str]]:
+              seen, skipped, samples = set(), 0, []
               for raw_line in src.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
                   line = raw_line.split("#", 1)[0].strip()
                   if not line:
@@ -426,6 +430,8 @@ jobs:
                       continue
                   if line.startswith(("regexp:", "keyword:", "include:")):
                       skipped += 1
+                      if len(samples) < 5:
+                          samples.append(raw_line.strip())
                       continue
                   if line.startswith("full:"):
                       prefix, raw_dom = "", line[5:]
@@ -436,32 +442,80 @@ jobs:
                   norm = normalize_domain(raw_dom)
                   if not norm:
                       skipped += 1
+                      if len(samples) < 5:
+                          samples.append(raw_line.strip())
                       continue
                   seen.add(f"{prefix}{norm}")
               items = sorted(seen)
               dst.write_text("\n".join(items) + ("\n" if items else ""), encoding="utf-8")
-              return len(items), skipped
+              return len(items), skipped, samples
 
-          def preprocess_plain_ip(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int]:
-              v4_nets, v6_nets, skipped = [], [], 0
-              for raw_line in src.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
-                  line = raw_line.split("#", 1)[0].strip().strip("'\"")
-                  if not line:
-                      continue
+          def parse_ip_entry(raw_line: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+              line = raw_line.split("#", 1)[0].strip()
+              if not line:
+                  return []
+              # Strip optional YAML list prefix or quotes
+              if line.startswith("- "):
+                  line = line[2:].strip()
+              line = line.strip("'\"")
+              if not line or line.lower() == "payload:":
+                  return []
+              # Strip optional Clash/V2Ray prefixes & trailing flags (e.g. IP-CIDR,1.2.3.4/32,no-resolve)
+              upper = line.upper()
+              if upper.startswith(("IP-CIDR,", "IP-CIDR6,")):
+                  line = line.split(",", 2)[1].strip()
+              elif upper.startswith("IP:"):
+                  line = line[3:].strip()
+              elif "," in line:
+                  line = line.split(",", 1)[0].strip()
+              # Strip whitespace-separated inline annotations
+              line = line.split()[0].strip("'\"")
+              # Handle bracketed IPv6 with optional port: [2001:db8::1]:443 or [2001:db8::1]
+              m = BRACKET_IP_RE.match(line)
+              if m:
+                  line = m.group(1)
+              # Handle IPv4 with port: 1.2.3.4:443 (IPv6 always contains >= 2 colons)
+              elif line.count(":") == 1:
+                  host, port = line.split(":", 1)
+                  if port.isdigit():
+                      line = host
+              # Handle IP range: 1.2.3.4-1.2.3.10
+              if "-" in line and "/" not in line:
+                  left, right = line.split("-", 1)
                   try:
-                      net = ipaddress.ip_network(line, strict=False)
+                      start_ip = ipaddress.ip_address(left.strip())
+                      end_ip = ipaddress.ip_address(right.strip())
+                      if start_ip.version == end_ip.version and start_ip <= end_ip:
+                          return list(ipaddress.summarize_address_range(start_ip, end_ip))
                   except ValueError:
-                      skipped += 1
+                      pass
+              try:
+                  return [ipaddress.ip_network(line, strict=False)]
+              except ValueError:
+                  return []
+
+          def preprocess_plain_ip(src: pathlib.Path, dst: pathlib.Path) -> tuple[int, int, list[str]]:
+              v4_nets, v6_nets, skipped, samples = [], [], 0, []
+              for raw_line in src.read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+                  cleaned = raw_line.split("#", 1)[0].strip()
+                  if not cleaned:
                       continue
-                  if isinstance(net, ipaddress.IPv4Network):
-                      v4_nets.append(net)
-                  else:
-                      v6_nets.append(net)
+                  nets = parse_ip_entry(raw_line)
+                  if not nets:
+                      skipped += 1
+                      if len(samples) < 5:
+                          samples.append(raw_line.strip())
+                      continue
+                  for net in nets:
+                      if isinstance(net, ipaddress.IPv4Network):
+                          v4_nets.append(net)
+                      else:
+                          v6_nets.append(net)
               collapsed = [str(n) for n in ipaddress.collapse_addresses(v4_nets)] + [
                   str(n) for n in ipaddress.collapse_addresses(v6_nets)
               ]
               dst.write_text("\n".join(collapsed) + ("\n" if collapsed else ""), encoding="utf-8")
-              return len(collapsed), skipped
+              return len(collapsed), skipped, samples
 
           def human_size(num_bytes: int) -> str:
               size = float(num_bytes)
@@ -511,6 +565,7 @@ jobs:
 
                   mode = rule["mode"]
                   skipped = 0
+                  samples: list[str] = []
                   if mode == "clash_yaml":
                       count = validate_clash_yaml(raw_path)
                       src_for_mihomo = raw_path
@@ -518,17 +573,19 @@ jobs:
                   else:
                       clean_path = CLEAN_DIR / f"{out_stem}.txt"
                       if mode == "plain_domain":
-                          count, skipped = preprocess_plain_domain(raw_path, clean_path)
+                          count, skipped, samples = preprocess_plain_domain(raw_path, clean_path)
                       elif mode == "v2ray_domain":
-                          count, skipped = preprocess_v2ray_domain(raw_path, clean_path)
+                          count, skipped, samples = preprocess_v2ray_domain(raw_path, clean_path)
                       elif mode == "plain_ip":
-                          count, skipped = preprocess_plain_ip(raw_path, clean_path)
+                          count, skipped, samples = preprocess_plain_ip(raw_path, clean_path)
                       else:
                           sys.exit(f"Unknown mode: {mode}")
 
                       if count == 0:
+                          raw_bytes = raw_path.stat().st_size
+                          diag = f"raw_bytes={raw_bytes}, skipped={skipped}, samples={samples}"
                           if allow_empty:
-                              print(f"  WARN: [{source['id']}] {rule['src_name']} has 0 valid entries, skipping MRS.")
+                              print(f"  WARN: [{source['id']}] {rule['src_name']} has 0 valid entries ({diag}), skipping MRS.")
                               src_entry["rules"].append({
                                   **rule,
                                   "mrs": mrs_name,
@@ -538,7 +595,7 @@ jobs:
                                   "skipped": skipped,
                               })
                               continue
-                          sys.exit(f"Zero valid entries after preprocessing: {rule['url']}")
+                          sys.exit(f"Zero valid entries after preprocessing ({diag}): {rule['url']}")
                       src_for_mihomo = clean_path
                       mihomo_fmt = "text"
 
@@ -669,7 +726,7 @@ jobs:
                       links = f"[Releases]({rel_url}) · [Raw]({raw_url}) · [CDN]({cdn_url})"
                       lines.append(f"| `{mrs}` | `{r['behavior']}` | {count_cell} | {r['size']} | {desc_cell} | {links} |")
                   else:
-                      lines.append(f"| `{mrs}` | `{r['behavior']}` | 0 | - | {desc_cell} | 当日无有效条目 |")
+                      lines.append(f"| `{mrs}` | `{r['behavior']}` | 0 | - | {desc_cell} | 当日上游无有效条目 |")
 
               if src["extras"]:
                   lines.append("")
