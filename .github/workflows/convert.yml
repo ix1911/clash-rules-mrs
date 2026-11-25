@@ -131,19 +131,20 @@ jobs:
             done
           } > release_notes.md
 
-          if gh release view latest >/dev/null 2>&1; then
-            gh release upload latest out/*.mrs out/checksums.sha256 --clobber
-            gh release view latest --json assets -q '.assets[].name' | while IFS= read -r asset; do
+          if gh release view latest --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload latest out/*.mrs out/checksums.sha256 --repo "$GH_REPO" --clobber
+            gh release view latest --repo "$GH_REPO" --json assets -q '.assets[].name' | while IFS= read -r asset; do
               [ -z "$asset" ] && continue
               if [ ! -f "out/${asset}" ]; then
                 echo "Removing stale release asset: ${asset}"
-                gh release delete-asset latest "${asset}" --yes
+                gh release delete-asset latest "${asset}" --repo "$GH_REPO" --yes
               fi
             done
-            gh release edit latest --latest --notes-file release_notes.md
+            gh release edit latest --repo "$GH_REPO" --latest --notes-file release_notes.md
           else
-            DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
+            DEFAULT_BRANCH=$(gh api "repos/${GH_REPO}" --jq '.default_branch')
             gh release create latest out/*.mrs out/checksums.sha256 \
+              --repo "$GH_REPO" \
               --target "$DEFAULT_BRANCH" \
               --title "Latest MRS Rules" \
               --latest \
